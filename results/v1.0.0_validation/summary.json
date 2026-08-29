@@ -1,0 +1,52 @@
+{
+  "episodes": 100,
+  "collision_rate": 0.01,
+  "episode_completion_rate": 0.99,
+  "average_speed_mps": 23.294850462272112,
+  "mean_cumulative_reward": 15.193666584283598,
+  "std_cumulative_reward": 7.610162468435649,
+  "mean_lane_changes_per_episode": 2.41,
+  "mean_lane_changes_per_100_steps": 6.333333333333334,
+  "shield_intervention_rate": 0.0,
+  "mean_shield_interventions_per_episode": 0.0,
+  "shield_unsafe_request_rate": 0.0,
+  "shield_cooldown_request_rate": 0.0,
+  "unavailable_action_request_rate": 0.0,
+  "mean_keep_lane_share": 0.9366666666666668,
+  "mean_overtakes_per_episode": 0.95,
+  "mean_overtake_attempts_per_episode": 1.84,
+  "overtake_success_rate": 0.5163043478260869,
+  "overtake_outcomes": {
+    "success": 95,
+    "expired": 68,
+    "returned_to_source_lane": 0,
+    "crashed": 0,
+    "lost_leader": 0,
+    "episode_ended": 21
+  },
+  "overtake_superseded": 0,
+  "overtake_attempts_resolved": 184,
+  "overtake_accounting_balanced": true,
+  "shield_interventions_per_lane_change": 0.0,
+  "crash_causes": {
+    "ego rear-ended leader": 0,
+    "rear-ended by follower": 0,
+    "lane-change contact": 1
+  },
+  "action_mix": {
+    "LANE_LEFT": 0.025249999999999998,
+    "KEEP_LANE": 0.9366666666666668,
+    "LANE_RIGHT": 0.03808333333333334
+  },
+  "action_availability": {
+    "LANE_LEFT": 0.03775,
+    "KEEP_LANE": 1.0,
+    "LANE_RIGHT": 0.03808333333333334
+  },
+  "seed_split": "validation",
+  "seed_start": 5000,
+  "config_overrides": {
+    "lane_change_cooldown": 8,
+    "overtake_window": 8
+  }
+}

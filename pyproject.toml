@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "highway-rl-lane-change-decision"
+version = "1.0.0"
+description = "PPO baseline for highway lane-change decision making"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "gymnasium>=1.0,<2.0",
+  "highway-env>=1.10,<2.0",
+  "stable-baselines3>=2.5,<3.0",
+  "sb3-contrib>=2.5,<3.0",
+  "torch>=2.1,<2.9",
+  "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9"]
+
+[project.scripts]
+highway-train = "highway_rl.train:main"
+highway-evaluate = "highway_rl.evaluate:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+markers = [
+  "slow: end-to-end rollouts that take tens of seconds",
+]
