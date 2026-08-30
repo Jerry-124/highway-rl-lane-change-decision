@@ -206,3 +206,7 @@ highway-rl-lane-change-decision/
   high-fidelity vehicle dynamics, hardware latency, or real-road validation.
 - The reported percentages are estimates from 100 episodes per held-out split,
   not real-world safety guarantees.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
