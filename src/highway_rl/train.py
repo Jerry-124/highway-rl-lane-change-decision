@@ -6,8 +6,8 @@ import argparse
 from functools import partial
 from pathlib import Path
 
-from stable_baselines3 import PPO
 from sb3_contrib import MaskablePPO
+from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.utils import FloatSchedule
@@ -101,99 +101,121 @@ def reset_critic(model) -> None:
           "actor weights kept")
 
 
-def main() -> None:
-    args = parse_args()
-    overrides = apply_overrides(args.set)
-    if overrides:
-        print(f"config overrides: {overrides}")
-    # Stable-Baselines3 resolves "auto" to CUDA when available, otherwise CPU.
-    device = args.device
+def _validate_training_args(args: argparse.Namespace) -> None:
     if (args.n_steps * args.n_envs) % args.batch_size != 0:
         raise ValueError("batch-size must divide n-steps * n-envs")
 
+
+def _make_vector_env(args: argparse.Namespace):
     args.model_path.parent.mkdir(parents=True, exist_ok=True)
     args.log_dir.mkdir(parents=True, exist_ok=True)
-    # make_vec_env defaults to DummyVecEnv, which steps environments in the
-    # same process: adding environments then adds no parallelism at all.
     vec_env_cls = SubprocVecEnv if args.vec_env == "subproc" else DummyVecEnv
-    vec_env = make_vec_env(
+    return make_vec_env(
         make_env,
         n_envs=args.n_envs,
         seed=args.seed,
         monitor_dir=str(args.log_dir),
         vec_env_cls=vec_env_cls,
     )
+
+
+def _new_model(args: argparse.Namespace, vec_env):
+    algorithm = MaskablePPO if args.mask_actions else PPO
+    return algorithm(
+        "MlpPolicy",
+        vec_env,
+        learning_rate=args.learning_rate,
+        n_steps=args.n_steps,
+        batch_size=args.batch_size,
+        n_epochs=args.n_epochs,
+        gamma=args.gamma,
+        gae_lambda=PPO_CONFIG["gae_lambda"],
+        clip_range=PPO_CONFIG["clip_range"],
+        ent_coef=args.ent_coef,
+        policy_kwargs=PPO_CONFIG["policy_kwargs"],
+        seed=args.seed,
+        device=args.device,
+        verbose=1,
+    )
+
+
+def _transfer_ppo_to_maskable(args: argparse.Namespace, vec_env):
+    source = PPO.load(args.resume_from, device=args.device)
+    model = MaskablePPO(
+        "MlpPolicy",
+        vec_env,
+        learning_rate=args.learning_rate,
+        n_steps=args.n_steps,
+        batch_size=args.batch_size,
+        n_epochs=args.n_epochs,
+        gamma=args.gamma,
+        gae_lambda=PPO_CONFIG["gae_lambda"],
+        clip_range=PPO_CONFIG["clip_range"],
+        ent_coef=args.ent_coef,
+        policy_kwargs=PPO_CONFIG["policy_kwargs"],
+        seed=args.seed,
+        device=args.device,
+        verbose=1,
+    )
+    model.policy.load_state_dict(source.policy.state_dict(), strict=True)
+    if args.reset_critic:
+        reset_critic(model)
+    model.num_timesteps = source.num_timesteps
+    return model
+
+
+def _resume_model(args: argparse.Namespace, vec_env):
+    algorithm = MaskablePPO if args.resume_algorithm == "maskable-ppo" else PPO
+    model = algorithm.load(args.resume_from, env=vec_env, device=args.device)
+    model.gamma = args.gamma
+    model.ent_coef = args.ent_coef
+    model.learning_rate = args.learning_rate
+    model.lr_schedule = FloatSchedule(args.learning_rate)
+    for parameter_group in model.policy.optimizer.param_groups:
+        parameter_group["lr"] = args.learning_rate
+    model.verbose = 1
+    if args.reset_critic:
+        reset_critic(model)
+    return model
+
+
+def _build_model(args: argparse.Namespace, vec_env):
+    transfer_to_masked = (
+        args.resume_from and args.mask_actions and args.resume_algorithm == "ppo"
+    )
+    if transfer_to_masked:
+        return _transfer_ppo_to_maskable(args, vec_env)
+    if args.resume_from:
+        return _resume_model(args, vec_env)
+    return _new_model(args, vec_env)
+
+
+def _training_callback(args: argparse.Namespace):
+    if args.checkpoint_every <= 0:
+        return None
+    return [
+        CheckpointCallback(
+            save_freq=max(args.checkpoint_every // args.n_envs, 1),
+            save_path=str(args.log_dir / "checkpoints"),
+            name_prefix="ppo_step",
+            save_vecnormalize=False,
+        )
+    ]
+
+
+def main() -> None:
+    args = parse_args()
+    overrides = apply_overrides(args.set)
+    if overrides:
+        print(f"config overrides: {overrides}")
+    _validate_training_args(args)
+
+    vec_env = _make_vector_env(args)
     try:
-        if args.resume_from and args.mask_actions and args.resume_algorithm == "ppo":
-            # Keep the source representation and action/value heads, but reset
-            # the optimizer under MaskablePPO. The two policy classes use
-            # the same network parameter layout; only action sampling differs.
-            source = PPO.load(args.resume_from, device=device)
-            model = MaskablePPO(
-                "MlpPolicy",
-                vec_env,
-                learning_rate=args.learning_rate,
-                n_steps=args.n_steps,
-                batch_size=args.batch_size,
-                n_epochs=args.n_epochs,
-                gamma=args.gamma,
-                gae_lambda=PPO_CONFIG["gae_lambda"],
-                clip_range=PPO_CONFIG["clip_range"],
-                ent_coef=args.ent_coef,
-                policy_kwargs=PPO_CONFIG["policy_kwargs"],
-                seed=args.seed,
-                device=device,
-                verbose=1,
-            )
-            model.policy.load_state_dict(source.policy.state_dict(), strict=True)
-            if args.reset_critic:
-                reset_critic(model)
-            model.num_timesteps = source.num_timesteps
-        elif args.resume_from:
-            algorithm = MaskablePPO if args.resume_algorithm == "maskable-ppo" else PPO
-            model = algorithm.load(args.resume_from, env=vec_env, device=device)
-            model.gamma = args.gamma
-            model.ent_coef = args.ent_coef
-            model.learning_rate = args.learning_rate
-            model.lr_schedule = FloatSchedule(args.learning_rate)
-            for parameter_group in model.policy.optimizer.param_groups:
-                parameter_group["lr"] = args.learning_rate
-            model.verbose = 1
-            if args.reset_critic:
-                reset_critic(model)
-        else:
-            algorithm = MaskablePPO if args.mask_actions else PPO
-            model = algorithm(
-                "MlpPolicy",
-                vec_env,
-                learning_rate=args.learning_rate,
-                n_steps=args.n_steps,
-                batch_size=args.batch_size,
-                n_epochs=args.n_epochs,
-                gamma=args.gamma,
-                gae_lambda=PPO_CONFIG["gae_lambda"],
-                clip_range=PPO_CONFIG["clip_range"],
-                ent_coef=args.ent_coef,
-                policy_kwargs=PPO_CONFIG["policy_kwargs"],
-                seed=args.seed,
-                device=device,
-                verbose=1,
-            )
-        callbacks = []
-        if args.checkpoint_every > 0:
-            # CheckpointCallback counts VecEnv steps, not individual env steps,
-            # so the requested interval has to be divided by the env count.
-            callbacks.append(
-                CheckpointCallback(
-                    save_freq=max(args.checkpoint_every // args.n_envs, 1),
-                    save_path=str(args.log_dir / "checkpoints"),
-                    name_prefix="ppo_step",
-                    save_vecnormalize=False,
-                )
-            )
+        model = _build_model(args, vec_env)
         model.learn(
             total_timesteps=args.total_timesteps,
-            callback=callbacks or None,
+            callback=_training_callback(args),
             progress_bar=False,
             reset_num_timesteps=not bool(args.resume_from),
         )
@@ -201,7 +223,6 @@ def main() -> None:
         print(f"Saved PPO model to {args.model_path.with_suffix('.zip')}")
     finally:
         vec_env.close()
-
 
 if __name__ == "__main__":
     main()
