@@ -19,3 +19,22 @@ results/*
 !results/v1.0.0_test/**
 logs/
 work-mpl-cache/
+
+# Secrets and local credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+secrets.*
+credentials.*
+*.credentials
+.streamlit/secrets.toml
+
+# Local/OS artifacts
+.DS_Store
+Thumbs.db
