@@ -127,15 +127,15 @@ class RandomPolicy:
 def throughput(seconds: float = 20.0) -> float:
     """Measure environment interaction speed in steps/second (single env)."""
     env = make_env()
-    obs, _ = env.reset(seed=0)
+    _obs, _ = env.reset(seed=0)
     steps = 0
     start = time.perf_counter()
     try:
         while time.perf_counter() - start < seconds:
-            obs, _r, terminated, truncated, _i = env.step(env.action_space.sample())
+            _obs, _r, terminated, truncated, _i = env.step(env.action_space.sample())
             steps += 1
             if terminated or truncated:
-                obs, _ = env.reset()
+                _obs, _ = env.reset()
     finally:
         env.close()
     return steps / (time.perf_counter() - start)

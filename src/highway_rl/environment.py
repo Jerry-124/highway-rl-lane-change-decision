@@ -25,9 +25,9 @@ and PPO must not keep crediting requests that were never executed.
 from __future__ import annotations
 
 import gymnasium as gym
-from gymnasium import spaces
 import highway_env  # noqa: F401 - importing registers highway-env environments
 import numpy as np
+from gymnasium import spaces
 from highway_env import utils
 from highway_env.envs.highway_env import HighwayEnvFast
 from highway_env.vehicle.controller import ControlledVehicle
@@ -276,10 +276,10 @@ class HighwayLaneChangeEnv(HighwayEnvFast):
         ):
             return False
         # merging behind a slow vehicle defeats the purpose of the manoeuvre
-        if front_gap < float(self.config["shield_lookahead"]):
-            if float(front_vehicle.speed) < float(self.config["shield_min_lane_speed"]):
-                return False
-        return True
+        return not (
+            front_gap < float(self.config["shield_lookahead"])
+            and float(front_vehicle.speed) < float(self.config["shield_min_lane_speed"])
+        )
 
     def _shield(self, action: int) -> int:
         """Veto unsafe lateral actions, recording why in `self._shield_mode`.
@@ -457,115 +457,169 @@ class HighwayLaneChangeEnv(HighwayEnvFast):
         # instance attribute shadows the bound method for this vehicle only
         vehicle.speed_control = clipped_speed_control
 
-    def step(self, action: int):
+    def _prepare_step(self, action: int):
+        """Capture decision-time state and apply the safety shield."""
         self._cache.clear()
-        # context captured before the physics update: the overtake event needs
-        # to know who the leader was when the manoeuvre started
         blocked_before = self._blocked()
         leader_before = self._leader()
         lane_before = int(self.vehicle.lane_index[2])
         target_before = int(self.vehicle.target_lane_index[2])
-
-        # longitudinal control is not learned: ask the rule layer for a speed
         self.vehicle.target_speed = self._desired_speed()
 
         requested = int(action)
         applied = self._shield(requested)
         self._shield_intervened = applied != requested
-        # freeze the decision-time facts before the physics update moves the world
         self._capture_decision_context(applied)
+        return (
+            requested,
+            applied,
+            blocked_before,
+            leader_before,
+            lane_before,
+            target_before,
+        )
 
-        observation, reward, terminated, truncated, info = super().step(applied)
+    def _register_overtake_attempt(
+        self,
+        *,
+        target_before: int,
+        target_after: int,
+        blocked_before: float,
+        leader_before,
+        lane_before: int,
+    ) -> tuple[bool, bool]:
+        """Arm a pass attempt, superseding an unresolved older manoeuvre."""
+        if target_after == target_before:
+            return False, False
 
-        lane_after = int(self.vehicle.lane_index[2])
-        target_after = int(self.vehicle.target_lane_index[2])
-        overtake_attempt_started = False
-        overtake_superseded = False
+        superseded = self._overtake_leader is not None
+        if superseded:
+            self._overtake_leader = None
 
-        if target_after != target_before:
-            # a manoeuvre was initiated: remember what we are trying to pass.
-            # The pass itself only happens a second or two after the lane
-            # change completes, so the attempt stays armed for a few steps.
-            # An attempt still armed at this point never resolved - this new
-            # manoeuvre replaced it, which is its own outcome and not a success.
-            if self._overtake_leader is not None:
-                overtake_superseded = True
-                self._overtake_leader = None
-            # Only a manoeuvre that set out to pass someone counts as an
-            # attempt. Arming on an unblocked lane change would let such a
-            # manoeuvre resolve as "success" with no matching attempt on the
-            # denominator, and with a zero bonus because _overtake_blocked is 0.
-            if blocked_before > 0.0 and leader_before is not None:
-                self._overtake_leader = leader_before
-                self._overtake_blocked = blocked_before
-                self._overtake_source_lane = lane_before
-                self._overtake_countdown = int(self.config["overtake_window"])
-                overtake_attempt_started = True
+        if blocked_before <= 0.0 or leader_before is None:
+            return False, superseded
 
+        self._overtake_leader = leader_before
+        self._overtake_blocked = blocked_before
+        self._overtake_source_lane = lane_before
+        self._overtake_countdown = int(self.config["overtake_window"])
+        return True, superseded
+
+    def _update_lane_change_cooldown(self, lane_before: int, lane_after: int) -> None:
         if lane_after != lane_before:
             self._lane_change_cooldown = int(self.config["lane_change_cooldown"])
         elif self._lane_change_cooldown > 0:
             self._lane_change_cooldown -= 1
 
-        overtake_bonus = 0.0
-        overtake_outcome = None
-        if self._overtake_leader is not None:
-            leader = self._overtake_leader
-            # the leader can leave the road while we are passing it; the attempt
-            # is then unresolvable rather than failed
-            leader_gone = not any(other is leader for other in self.road.vehicles)
-            passed = (
-                not leader_gone
-                and lane_after != self._overtake_source_lane
-                and float(self.vehicle.position[0]) - float(leader.position[0])
-                > float(self.config["overtake_margin"])
-            )
-            if passed and not self.vehicle.crashed:
-                overtake_bonus = (
-                    float(self.config["overtake_reward"]) * self._overtake_blocked
-                )
-                overtake_outcome = "success"
-                self._overtake_leader = None
-            elif self.vehicle.crashed:
-                overtake_outcome = "crashed"
-                self._overtake_leader = None
-            elif lane_after == self._overtake_source_lane:
-                # merged back before completing the pass
-                overtake_outcome = "returned_to_source_lane"
-                self._overtake_leader = None
-            elif leader_gone:
-                overtake_outcome = "lost_leader"
-                self._overtake_leader = None
-            else:
-                self._overtake_countdown -= 1
-                if self._overtake_countdown <= 0:
-                    overtake_outcome = "expired"
-                    self._overtake_leader = None
-                elif terminated or truncated:
-                    # ran out of episode, not out of time
-                    overtake_outcome = "episode_ended"
-                    self._overtake_leader = None
-                # still armed: deliberately report nothing. Emitting a
-                # "pending" outcome here would make a caller that counts
-                # outcomes once per step count steps, not attempts.
+    def _finish_overtake(
+        self,
+        outcome: str,
+        bonus: float = 0.0,
+    ) -> tuple[float, str]:
+        self._overtake_leader = None
+        return bonus, outcome
 
-        # Applied here rather than inside _rewards so the credit survives even
-        # when the episode ends on the completing step.
+    def _resolve_overtake(
+        self,
+        lane_after: int,
+        *,
+        terminated: bool,
+        truncated: bool,
+    ) -> tuple[float, str | None]:
+        leader = self._overtake_leader
+        if leader is None:
+            return 0.0, None
+
+        leader_gone = not any(other is leader for other in self.road.vehicles)
+        passed = (
+            not leader_gone
+            and lane_after != self._overtake_source_lane
+            and float(self.vehicle.position[0]) - float(leader.position[0])
+            > float(self.config["overtake_margin"])
+        )
+        if passed and not self.vehicle.crashed:
+            bonus = float(self.config["overtake_reward"]) * self._overtake_blocked
+            return self._finish_overtake("success", bonus)
+        if self.vehicle.crashed:
+            return self._finish_overtake("crashed")
+        if lane_after == self._overtake_source_lane:
+            return self._finish_overtake("returned_to_source_lane")
+        if leader_gone:
+            return self._finish_overtake("lost_leader")
+
+        self._overtake_countdown -= 1
+        if self._overtake_countdown <= 0:
+            return self._finish_overtake("expired")
+        if terminated or truncated:
+            return self._finish_overtake("episode_ended")
+        return 0.0, None
+
+    def _augment_step_info(
+        self,
+        info: dict,
+        *,
+        requested: int,
+        applied: int,
+        blocked_before: float,
+        overtake_bonus: float,
+        overtake_outcome: str | None,
+        overtake_superseded: bool,
+        overtake_attempt_started: bool,
+    ) -> None:
+        info.update(
+            {
+                "shield_intervened": self._shield_intervened,
+                "shield_mode": self._shield_mode,
+                "requested_action": requested,
+                "applied_action": applied,
+                "overtake_bonus": overtake_bonus,
+                "overtake_outcome": overtake_outcome,
+                "overtake_superseded": overtake_superseded,
+                "overtake_attempt_started": overtake_attempt_started,
+                "blocked": blocked_before,
+                "target_speed": float(self.vehicle.target_speed),
+            }
+        )
+
+    def step(self, action: int):
+        (
+            requested,
+            applied,
+            blocked_before,
+            leader_before,
+            lane_before,
+            target_before,
+        ) = self._prepare_step(action)
+        observation, reward, terminated, truncated, info = super().step(applied)
+
+        lane_after = int(self.vehicle.lane_index[2])
+        target_after = int(self.vehicle.target_lane_index[2])
+        attempt_started, superseded = self._register_overtake_attempt(
+            target_before=target_before,
+            target_after=target_after,
+            blocked_before=blocked_before,
+            leader_before=leader_before,
+            lane_before=lane_before,
+        )
+        self._update_lane_change_cooldown(lane_before, lane_after)
+        overtake_bonus, overtake_outcome = self._resolve_overtake(
+            lane_after,
+            terminated=terminated,
+            truncated=truncated,
+        )
         reward += overtake_bonus
-
         self._previous_lane = lane_after
-        info["shield_intervened"] = self._shield_intervened
-        info["shield_mode"] = self._shield_mode
-        info["requested_action"] = requested
-        info["applied_action"] = applied
-        info["overtake_bonus"] = overtake_bonus
-        info["overtake_outcome"] = overtake_outcome
-        info["overtake_superseded"] = overtake_superseded
-        info["overtake_attempt_started"] = overtake_attempt_started
-        info["blocked"] = blocked_before
-        info["target_speed"] = float(self.vehicle.target_speed)
+        self._augment_step_info(
+            info,
+            requested=requested,
+            applied=applied,
+            blocked_before=blocked_before,
+            overtake_bonus=overtake_bonus,
+            overtake_outcome=overtake_outcome,
+            overtake_superseded=superseded,
+            overtake_attempt_started=attempt_started,
+        )
         return observation, reward, terminated, truncated, info
-
 
 class ActionMaskObservation(gym.ObservationWrapper):
     """Append the shield's action-availability mask to the observation.

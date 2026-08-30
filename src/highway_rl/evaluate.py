@@ -5,16 +5,16 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from statistics import fmean, pstdev
 from typing import Protocol
 
 import numpy as np
-from stable_baselines3 import PPO
 from sb3_contrib import MaskablePPO
+from stable_baselines3 import PPO
 
-from highway_rl.config import ACTION_NAMES, ENV_CONFIG, SEED_SPLITS, apply_overrides
+from highway_rl.config import ACTION_NAMES, SEED_SPLITS, apply_overrides
 from highway_rl.environment import OVERTAKE_OUTCOMES, make_env
 
 
@@ -27,6 +27,11 @@ NO_CRASH = "none"
 FRONT_REAR_END = "ego rear-ended leader"
 REAR_REAR_END = "rear-ended by follower"
 LANE_CHANGE_CONTACT = "lane-change contact"
+SERIALIZED_MAPPING_FIELDS = {
+    "action_mix",
+    "action_availability",
+    "overtake_outcomes",
+}
 
 
 @dataclass
@@ -37,6 +42,7 @@ class EpisodeMetrics:
     cumulative_reward: float
     lane_changes: int
     steps: int
+    expected_steps: int
     lane_changes_per_100_steps: float
     shield_interventions: int
     shield_unsafe_requests: int
@@ -50,6 +56,94 @@ class EpisodeMetrics:
     crash_cause: str
     action_mix: dict[str, float]
     action_availability: dict[str, float]
+
+
+@dataclass
+class _EpisodeAccumulator:
+    previous_lane: int
+    expected_steps: int
+    speeds: list[float] = field(default_factory=list)
+    total_reward: float = 0.0
+    lane_changes: int = 0
+    collision: bool = False
+    steps: int = 0
+    interventions: int = 0
+    unsafe_requests: int = 0
+    cooldown_requests: int = 0
+    unavailable_requests: int = 0
+    overtakes: int = 0
+    overtake_attempts: int = 0
+    superseded: int = 0
+    outcomes: dict[str, int] = field(
+        default_factory=lambda: {name: 0 for name in OVERTAKE_OUTCOMES}
+    )
+    action_counts: list[int] = field(
+        default_factory=lambda: [0] * len(ACTION_NAMES)
+    )
+    availability_counts: list[int] = field(
+        default_factory=lambda: [0] * len(ACTION_NAMES)
+    )
+
+    def record_action_mask(self, action_mask: np.ndarray) -> None:
+        for index, available in enumerate(action_mask):
+            self.availability_counts[index] += int(available > 0.5)
+
+    def record_requested_action(self, action: int, action_mask: np.ndarray) -> None:
+        self.action_counts[action] += 1
+        self.unavailable_requests += int(action_mask[action] <= 0.5)
+
+    def record_transition(self, env, reward: float, info: dict) -> None:
+        self.steps += 1
+        self.total_reward += float(reward)
+        self.speeds.append(float(env.unwrapped.vehicle.speed))
+        self.collision = self.collision or bool(
+            info.get("crashed", env.unwrapped.vehicle.crashed)
+        )
+        self.interventions += int(bool(info.get("shield_intervened", False)))
+        self.unsafe_requests += int(info.get("shield_mode", 0) == 1)
+        self.cooldown_requests += int(info.get("shield_mode", 0) == 2)
+        self.overtakes += int(float(info.get("overtake_bonus", 0.0)) > 0.0)
+        self.overtake_attempts += int(bool(info.get("overtake_attempt_started", False)))
+        outcome = info.get("overtake_outcome")
+        if outcome is not None:
+            self.outcomes[outcome] += 1
+        self.superseded += int(bool(info.get("overtake_superseded", False)))
+        current_lane = _lane_id(env)
+        self.lane_changes += int(current_lane != self.previous_lane)
+        self.previous_lane = current_lane
+
+    def to_metrics(self, episode: int, env) -> EpisodeMetrics:
+        steps = self.steps
+        return EpisodeMetrics(
+            episode=episode + 1,
+            collision=self.collision,
+            average_speed_mps=fmean(self.speeds) if self.speeds else 0.0,
+            cumulative_reward=self.total_reward,
+            lane_changes=self.lane_changes,
+            steps=steps,
+            expected_steps=self.expected_steps,
+            lane_changes_per_100_steps=(
+                100.0 * self.lane_changes / steps if steps else 0.0
+            ),
+            shield_interventions=self.interventions,
+            shield_unsafe_requests=self.unsafe_requests,
+            shield_cooldown_requests=self.cooldown_requests,
+            unavailable_action_requests=self.unavailable_requests,
+            overtakes=self.overtakes,
+            overtake_attempts=self.overtake_attempts,
+            overtake_outcomes=dict(self.outcomes),
+            overtake_superseded=self.superseded,
+            keep_lane_share=(self.action_counts[KEEP_LANE] / steps if steps else 0.0),
+            crash_cause=_crash_cause(env) if self.collision else NO_CRASH,
+            action_mix={
+                name: count / steps if steps else 0.0
+                for name, count in zip(ACTION_NAMES, self.action_counts)
+            },
+            action_availability={
+                name: count / steps if steps else 0.0
+                for name, count in zip(ACTION_NAMES, self.availability_counts)
+            },
+        )
 
 
 def _lane_id(env) -> int:
@@ -89,6 +183,55 @@ def _crash_cause(env) -> str:
     return LANE_CHANGE_CONTACT
 
 
+def _expected_episode_steps(env) -> int:
+    return int(
+        float(env.unwrapped.config["duration"])
+        * float(env.unwrapped.config["policy_frequency"])
+    )
+
+
+def _select_action(
+    policy: Policy,
+    observation: np.ndarray,
+    use_action_masks: bool,
+    accumulator: _EpisodeAccumulator,
+) -> int:
+    action_mask = np.asarray(observation[-len(ACTION_NAMES) :])
+    accumulator.record_action_mask(action_mask)
+    predict_kwargs = (
+        {"action_masks": action_mask.astype(bool)} if use_action_masks else {}
+    )
+    action, _ = policy.predict(observation, deterministic=True, **predict_kwargs)
+    action = int(action)
+    accumulator.record_requested_action(action, action_mask)
+    return action
+
+
+def _evaluate_episode(
+    policy: Policy,
+    env,
+    episode: int,
+    seed: int,
+    use_action_masks: bool,
+) -> EpisodeMetrics:
+    observation, _ = env.reset(seed=seed + episode)
+    accumulator = _EpisodeAccumulator(
+        previous_lane=_lane_id(env),
+        expected_steps=_expected_episode_steps(env),
+    )
+    terminated = truncated = False
+    while not (terminated or truncated):
+        action = _select_action(
+            policy,
+            observation,
+            use_action_masks,
+            accumulator,
+        )
+        observation, reward, terminated, truncated, info = env.step(action)
+        accumulator.record_transition(env, reward, info)
+    return accumulator.to_metrics(episode, env)
+
+
 def evaluate(
     policy: Policy,
     episodes: int,
@@ -98,170 +241,154 @@ def evaluate(
     env=None,
 ) -> list[EpisodeMetrics]:
     # `env` lets a caller hand in an environment the policy is already bound
-    # to, which is how the rule-based baselines are measured through exactly
-    # the same metric pipeline as a learned policy.
+    # to, which is how rule-based baselines use the same metric pipeline.
     owns_env = env is None
     if owns_env:
         env = make_env()
-    rows: list[EpisodeMetrics] = []
     try:
-        for episode in range(episodes):
-            observation, _ = env.reset(seed=seed + episode)
-            previous_lane = _lane_id(env)
-            speeds: list[float] = []
-            total_reward = 0.0
-            lane_changes = 0
-            collision = False
-            steps = 0
-            interventions = 0
-            unsafe_requests = 0
-            cooldown_requests = 0
-            unavailable_requests = 0
-            overtakes = 0
-            overtake_attempts = 0
-            outcomes = {name: 0 for name in OVERTAKE_OUTCOMES}
-            superseded = 0
-            action_counts = [0] * len(ACTION_NAMES)
-            availability_counts = [0] * len(ACTION_NAMES)
-            terminated = truncated = False
-
-            while not (terminated or truncated):
-                action_mask = np.asarray(observation[-len(ACTION_NAMES):])
-                for index, available in enumerate(action_mask):
-                    availability_counts[index] += int(available > 0.5)
-                predict_kwargs = (
-                    {"action_masks": action_mask.astype(bool)}
-                    if use_action_masks else {}
-                )
-                action, _ = policy.predict(
-                    observation, deterministic=True, **predict_kwargs
-                )
-                action = int(action)
-                action_counts[action] += 1
-                unavailable_requests += int(action_mask[action] <= 0.5)
-                observation, reward, terminated, truncated, info = env.step(action)
-                steps += 1
-                total_reward += float(reward)
-                speeds.append(float(env.unwrapped.vehicle.speed))
-                collision = collision or bool(info.get("crashed", env.unwrapped.vehicle.crashed))
-                interventions += int(bool(info.get("shield_intervened", False)))
-                unsafe_requests += int(info.get("shield_mode", 0) == 1)
-                cooldown_requests += int(info.get("shield_mode", 0) == 2)
-                overtakes += int(float(info.get("overtake_bonus", 0.0)) > 0.0)
-                overtake_attempts += int(bool(info.get("overtake_attempt_started", False)))
-                outcome = info.get("overtake_outcome")
-                if outcome is not None:
-                    outcomes[outcome] += 1
-                superseded += int(bool(info.get("overtake_superseded", False)))
-                current_lane = _lane_id(env)
-                lane_changes += int(current_lane != previous_lane)
-                previous_lane = current_lane
-
-            rows.append(
-                EpisodeMetrics(
-                    episode=episode + 1,
-                    collision=collision,
-                    average_speed_mps=fmean(speeds) if speeds else 0.0,
-                    cumulative_reward=total_reward,
-                    lane_changes=lane_changes,
-                    steps=steps,
-                    lane_changes_per_100_steps=100.0 * lane_changes / steps if steps else 0.0,
-                    shield_interventions=interventions,
-                    shield_unsafe_requests=unsafe_requests,
-                    shield_cooldown_requests=cooldown_requests,
-                    unavailable_action_requests=unavailable_requests,
-                    overtakes=overtakes,
-                    overtake_attempts=overtake_attempts,
-                    overtake_outcomes=dict(outcomes),
-                    overtake_superseded=superseded,
-                    keep_lane_share=action_counts[KEEP_LANE] / steps if steps else 0.0,
-                    crash_cause=_crash_cause(env) if collision else NO_CRASH,
-                    action_mix={
-                        name: count / steps if steps else 0.0
-                        for name, count in zip(ACTION_NAMES, action_counts)
-                    },
-                    action_availability={
-                        name: count / steps if steps else 0.0
-                        for name, count in zip(ACTION_NAMES, availability_counts)
-                    },
-                )
-            )
+        return [
+            _evaluate_episode(policy, env, episode, seed, use_action_masks)
+            for episode in range(episodes)
+        ]
     finally:
         if owns_env:
             env.close()
-    return rows
 
 
-def summarize(rows: list[EpisodeMetrics]) -> dict[str, float | int]:
+def _sum_metric(rows: list[EpisodeMetrics], attribute: str) -> int:
+    return sum(int(getattr(row, attribute)) for row in rows)
+
+
+def _mean_metric(rows: list[EpisodeMetrics], attribute: str) -> float:
+    return fmean(float(getattr(row, attribute)) for row in rows)
+
+
+def _mean_mapping(
+    rows: list[EpisodeMetrics],
+    attribute: str,
+    names: list[str],
+) -> dict[str, float]:
+    return {
+        name: fmean(float(getattr(row, attribute)[name]) for row in rows)
+        for name in names
+    }
+
+
+def _overtake_outcome_counts(rows: list[EpisodeMetrics]) -> dict[str, int]:
+    return {
+        name: sum(row.overtake_outcomes.get(name, 0) for row in rows)
+        for name in OVERTAKE_OUTCOMES
+    }
+
+
+def _crash_cause_counts(rows: list[EpisodeMetrics]) -> dict[str, int]:
+    causes = (FRONT_REAR_END, REAR_REAR_END, LANE_CHANGE_CONTACT)
+    return {cause: sum(row.crash_cause == cause for row in rows) for cause in causes}
+
+
+def _overtake_accounting(rows: list[EpisodeMetrics]) -> tuple[int, int, bool]:
+    resolved = sum(sum(row.overtake_outcomes.values()) for row in rows)
+    superseded = _sum_metric(rows, "overtake_superseded")
+    attempts = _sum_metric(rows, "overtake_attempts")
+    accounted = resolved + superseded
+    return superseded, accounted, accounted == attempts
+
+
+def summarize(rows: list[EpisodeMetrics]) -> dict[str, object]:
     rewards = [row.cumulative_reward for row in rows]
-    steps = sum(row.steps for row in rows) or 1
-    interventions = sum(row.shield_interventions for row in rows)
-    unsafe_requests = sum(row.shield_unsafe_requests for row in rows)
-    cooldown_requests = sum(row.shield_cooldown_requests for row in rows)
-    unavailable_requests = sum(row.unavailable_action_requests for row in rows)
-    overtake_attempts = sum(row.overtake_attempts for row in rows)
-    overtakes = sum(row.overtakes for row in rows)
-    lane_changes = sum(row.lane_changes for row in rows)
-    summary: dict[str, object] = {
-        "episodes": len(rows),
-        "collision_rate": fmean(float(row.collision) for row in rows),
+    steps = _sum_metric(rows, "steps") or 1
+    episodes = len(rows)
+    interventions = _sum_metric(rows, "shield_interventions")
+    unsafe_requests = _sum_metric(rows, "shield_unsafe_requests")
+    cooldown_requests = _sum_metric(rows, "shield_cooldown_requests")
+    unavailable_requests = _sum_metric(rows, "unavailable_action_requests")
+    overtake_attempts = _sum_metric(rows, "overtake_attempts")
+    overtakes = _sum_metric(rows, "overtakes")
+    lane_changes = _sum_metric(rows, "lane_changes")
+    superseded, attempts_resolved, accounting_balanced = _overtake_accounting(rows)
+
+    return {
+        "episodes": episodes,
+        "collision_rate": _mean_metric(rows, "collision"),
         "episode_completion_rate": fmean(
-            float(
-                row.steps
-                >= int(ENV_CONFIG["duration"] * ENV_CONFIG["policy_frequency"])
-            )
-            for row in rows
+            float(row.steps >= row.expected_steps) for row in rows
         ),
-        "average_speed_mps": fmean(row.average_speed_mps for row in rows),
+        "average_speed_mps": _mean_metric(rows, "average_speed_mps"),
         "mean_cumulative_reward": fmean(rewards),
         "std_cumulative_reward": pstdev(rewards) if len(rewards) > 1 else 0.0,
-        "mean_lane_changes_per_episode": fmean(row.lane_changes for row in rows),
-        "mean_lane_changes_per_100_steps": fmean(row.lane_changes_per_100_steps for row in rows),
-        # how much of the observed safety comes from the shield rather than the policy
+        "mean_lane_changes_per_episode": _mean_metric(rows, "lane_changes"),
+        "mean_lane_changes_per_100_steps": _mean_metric(
+            rows, "lane_changes_per_100_steps"
+        ),
         "shield_intervention_rate": interventions / steps,
-        "mean_shield_interventions_per_episode": interventions / len(rows),
+        "mean_shield_interventions_per_episode": interventions / episodes,
         "shield_unsafe_request_rate": unsafe_requests / steps,
         "shield_cooldown_request_rate": cooldown_requests / steps,
         "unavailable_action_request_rate": unavailable_requests / steps,
-        # collapses to 1.0 when the policy has stopped making lateral decisions
-        "mean_keep_lane_share": fmean(row.keep_lane_share for row in rows),
-        "mean_overtakes_per_episode": fmean(row.overtakes for row in rows),
-        "mean_overtake_attempts_per_episode": fmean(row.overtake_attempts for row in rows),
-        "overtake_success_rate": overtakes / overtake_attempts if overtake_attempts else 0.0,
-        # why the rest of the attempts did not convert
-        "overtake_outcomes": {
-            name: sum(row.overtake_outcomes.get(name, 0) for row in rows)
-            for name in OVERTAKE_OUTCOMES
-        },
-        # attempts replaced by another manoeuvre before they could resolve;
-        # without this the outcome counts do not add up to the attempt count
-        "overtake_superseded": sum(row.overtake_superseded for row in rows),
-        "overtake_attempts_resolved": sum(
-            sum(row.overtake_outcomes.values()) for row in rows
-        ) + sum(row.overtake_superseded for row in rows),
-        # Accounting invariant: every attempt must end in exactly one outcome
-        # or be superseded. If this is False the outcome distribution above is
-        # not a partition of the attempts and must not be read as percentages.
-        "overtake_accounting_balanced": (
-            sum(sum(row.overtake_outcomes.values()) for row in rows)
-            + sum(row.overtake_superseded for row in rows)
-        ) == overtake_attempts,
+        "mean_keep_lane_share": _mean_metric(rows, "keep_lane_share"),
+        "mean_overtakes_per_episode": _mean_metric(rows, "overtakes"),
+        "mean_overtake_attempts_per_episode": _mean_metric(rows, "overtake_attempts"),
+        "overtake_success_rate": (
+            overtakes / overtake_attempts if overtake_attempts else 0.0
+        ),
+        "overtake_outcomes": _overtake_outcome_counts(rows),
+        "overtake_superseded": superseded,
+        "overtake_attempts_resolved": attempts_resolved,
+        "overtake_accounting_balanced": accounting_balanced,
         "shield_interventions_per_lane_change": (
             interventions / lane_changes if lane_changes else 0.0
         ),
-        "crash_causes": {
-            cause: sum(row.crash_cause == cause for row in rows)
-            for cause in (FRONT_REAR_END, REAR_REAR_END, LANE_CHANGE_CONTACT)
-        },
-        "action_mix": {
-            name: fmean(row.action_mix[name] for row in rows) for name in ACTION_NAMES
-        },
-        "action_availability": {
-            name: fmean(row.action_availability[name] for row in rows)
-            for name in ACTION_NAMES
-        },
+        "crash_causes": _crash_cause_counts(rows),
+        "action_mix": _mean_mapping(rows, "action_mix", ACTION_NAMES),
+        "action_availability": _mean_mapping(
+            rows, "action_availability", ACTION_NAMES
+        ),
     }
-    return summary
+
+
+def _episode_columns(row: EpisodeMetrics) -> list[str]:
+    columns = [
+        key for key in asdict(row) if key not in SERIALIZED_MAPPING_FIELDS
+    ]
+    columns.extend(f"share_{name}" for name in ACTION_NAMES)
+    columns.extend(f"available_{name}" for name in ACTION_NAMES)
+    columns.extend(f"outcome_{name}" for name in OVERTAKE_OUTCOMES)
+    return columns
+
+
+def _episode_record(row: EpisodeMetrics) -> dict[str, object]:
+    record = {
+        key: value
+        for key, value in asdict(row).items()
+        if key not in SERIALIZED_MAPPING_FIELDS
+    }
+    record.update(
+        {f"share_{name}": share for name, share in row.action_mix.items()}
+    )
+    record.update(
+        {
+            f"available_{name}": share
+            for name, share in row.action_availability.items()
+        }
+    )
+    record.update(
+        {
+            f"outcome_{name}": row.overtake_outcomes.get(name, 0)
+            for name in OVERTAKE_OUTCOMES
+        }
+    )
+    return record
+
+
+def _write_episode_csv(rows: list[EpisodeMetrics], path: Path) -> None:
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=_episode_columns(rows[0]))
+        writer.writeheader()
+        writer.writerows(_episode_record(row) for row in rows)
+
+
+def _write_summary(summary: dict[str, object], path: Path) -> None:
+    path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
 
 
 def save_results(
@@ -274,32 +401,8 @@ def save_results(
     summary = summarize(rows)
     if metadata:
         summary.update(metadata)
-    excluded = {"action_mix", "action_availability", "overtake_outcomes"}
-    columns = [key for key in asdict(rows[0]) if key not in excluded]
-    columns += [f"share_{name}" for name in ACTION_NAMES]
-    columns += [f"available_{name}" for name in ACTION_NAMES]
-    columns += [f"outcome_{name}" for name in OVERTAKE_OUTCOMES]
-    with (output_dir / "episodes.csv").open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=columns)
-        writer.writeheader()
-        for row in rows:
-            record = {
-                key: value for key, value in asdict(row).items()
-                if key not in excluded
-            }
-            record.update({f"share_{name}": share for name, share in row.action_mix.items()})
-            record.update({
-                f"available_{name}": share
-                for name, share in row.action_availability.items()
-            })
-            record.update({
-                f"outcome_{name}": row.overtake_outcomes.get(name, 0)
-                for name in OVERTAKE_OUTCOMES
-            })
-            writer.writerow(record)
-    (output_dir / "summary.json").write_text(
-        json.dumps(summary, indent=2) + "\n", encoding="utf-8"
-    )
+    _write_episode_csv(rows, output_dir / "episodes.csv")
+    _write_summary(summary, output_dir / "summary.json")
     return summary
 
 
@@ -312,13 +415,11 @@ def parse_args() -> argparse.Namespace:
         "--split",
         choices=tuple(SEED_SPLITS),
         help="use a held-out seed set instead of --seed/--episodes; "
-             "dev is for debugging only and must not be reported as final",
+        "dev is for debugging only and must not be reported as final",
     )
     parser.add_argument("--output-dir", type=Path, default=Path("results"))
     parser.add_argument(
-        "--algorithm",
-        choices=("ppo", "maskable-ppo"),
-        default="ppo",
+        "--algorithm", choices=("ppo", "maskable-ppo"), default="ppo"
     )
     parser.add_argument(
         "--set",
@@ -326,7 +427,7 @@ def parse_args() -> argparse.Namespace:
         metavar="KEY=VALUE",
         default=[],
         help="override ENV_CONFIG entries for this run, e.g. "
-             "--set lane_change_cooldown=5",
+        "--set lane_change_cooldown=5",
     )
     return parser.parse_args()
 
