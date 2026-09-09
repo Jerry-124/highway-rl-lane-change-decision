@@ -1,33 +1,38 @@
-# Highway RL Lane-Change Decision
+# Highway Lane-Change Decision Making with Maskable PPO
 
-Safe and efficient highway lane-change decision making with Maskable PPO,
-Gymnasium, highway-env, and Stable-Baselines3.
+[![Version](https://img.shields.io/badge/version-v1.0.1-blueviolet)](CHANGELOG.md)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](#quick-start)
+[![Tests](https://img.shields.io/badge/tests-21-brightgreen)](#verification)
 
-**Release:** v1.0.0
+A reproducible simulation research project for high-level highway lane-change decision making with Maskable PPO, deterministic longitudinal control, action masking, and explicit execution constraints in `highway-env`.
 
-**Scope:** simulation research and portfolio demonstration; not for real-vehicle
-deployment.
+> This repository evaluates a hybrid decision system in simulation. It is not a real-vehicle safety system and does not model production perception, actuation, hardware latency, or road risk.
 
-## Overview
+## Highlights
 
-The learned policy makes only high-level lateral decisions:
+- **Lateral-only learned policy:** Maskable PPO selects `LANE_LEFT`, `KEEP_LANE`, or `LANE_RIGHT`.
+- **Deterministic longitudinal control:** speed control is separated from the reinforcement-learning action space.
+- **Action masking and safety constraints:** unavailable or unsafe lane changes are excluded before policy sampling and guarded again at execution time.
+- **Commitment constraint:** the lane-change cooldown matches the overtake window, preventing a new manoeuvre from silently replacing an active overtake attempt.
+- **Held-out evaluation:** the bundled v1.0.0 checkpoint is evaluated on independent 100-episode validation and test splits.
+- **Traceable artifacts:** raw episode records, summaries, a model card, and a SHA-256 checksum are committed with the release model.
 
-- `LANE_LEFT`
-- `KEEP_LANE`
-- `LANE_RIGHT`
+## System Architecture
 
-Longitudinal control is handled by a deterministic controller that cruises at
-30 m/s, prepares for a lane change at 25 m/s, and follows slower traffic when no
-safe adjacent lane is available. A safety layer exposes valid actions to
-Maskable PPO and blocks unsafe or rapidly repeated lane changes.
+| Layer | Responsibility | Learned |
+|---|---|:---:|
+| Maskable PPO | Select left, keep lane, or right | Yes |
+| Longitudinal controller | Cruise, prepare, and safe-following speed | No |
+| Action mask / safety shield | Reject unsafe or unavailable lane changes | No |
+| Commitment constraint | Prevent a new manoeuvre during the overtake window | No |
 
-This separation prevents the degenerate “always brake” policy observed when
-speed and lane decisions were learned in a single five-action space.
+The observation contains 53 values: 10 nearby vehicles × 5 normalized kinematic features, followed by 3 action-availability flags.
 
-## v1.0.0 results
+The three-action lateral policy keeps high-level lane selection separate from longitudinal speed control. Earlier joint speed-and-lane experiments are not part of the stable public baseline.
 
-The saved policy was evaluated deterministically on two independent, held-out
-sets of 100 episodes. Neither split was used for training.
+## Key Results
+
+The bundled `ppo_highway_v1.0.0.zip` policy was evaluated deterministically on two independent held-out sets of 100 episodes. Neither split was used for training. The v1.0.1 software-maintenance release does not change the model weights or these benchmark artifacts.
 
 | Metric | Validation seeds 5000–5099 | Test seeds 9000–9099 | Target |
 |---|---:|---:|---:|
@@ -40,30 +45,13 @@ sets of 100 episodes. Neither split was used for training.
 | Unavailable-action requests | **0.0%** | **0.0%** | 0% |
 | Superseded overtake attempts | **0** | **0** | 0 |
 
-The 8-step lane-change cooldown matches the 8-step overtake window. This acts as
-a commitment constraint: once an overtake starts, another manoeuvre cannot
-silently replace it before the attempt resolves.
+Validation contained one lane-change contact. Test contained one rear-end by a follower and one lane-change contact; there were no ego-to-leader rear-end collisions in either held-out split.
 
-Raw summaries and per-episode records are stored in
-[`results/v1.0.0_validation`](results/v1.0.0_validation) and
-[`results/v1.0.0_test`](results/v1.0.0_test). Full model details are in the
-[`v1.0.0 model card`](results/v1.0.0/MODEL_CARD.md).
+Evidence is stored in [`results/v1.0.0_validation`](results/v1.0.0_validation), [`results/v1.0.0_test`](results/v1.0.0_test), and the [`v1.0.0 model card`](results/v1.0.0/MODEL_CARD.md).
 
-## Architecture
+## Core Configuration
 
-| Layer | Responsibility | Learned |
-|---|---|:---:|
-| Maskable PPO | Select left, keep lane, or right | Yes |
-| Longitudinal controller | Cruise, prepare, and safe following speed | No |
-| Action mask / safety shield | Reject unsafe or unavailable lane changes | No |
-| Commitment constraint | Prevent a new manoeuvre during the overtake window | No |
-
-The observation has 53 values: 10 nearby vehicles × 5 normalized kinematic
-features, followed by 3 action-availability flags.
-
-## Core configuration
-
-### Environment and controller
+### Environment and Controller
 
 | Parameter | Value |
 |---|---:|
@@ -76,7 +64,7 @@ features, followed by 3 action-availability flags.
 | Safe time headway | 1.5 s |
 | Lane-change cooldown / overtake window | 8 / 8 decisions |
 
-### Reward coefficients
+### Reward Coefficients
 
 | Term | Weight |
 |---|---:|
@@ -90,7 +78,7 @@ features, followed by 3 action-availability flags.
 | Short headway | -0.5 |
 | Alive reward | 0.0 |
 
-### PPO
+### Maskable PPO
 
 | Parameter | Value |
 |---|---:|
@@ -101,9 +89,9 @@ features, followed by 3 action-availability flags.
 | PPO epochs / clip range | 10 / 0.2 |
 | `n_steps` / batch size | 256 / 256 |
 
-The executable source of truth is [`src/highway_rl/config.py`](src/highway_rl/config.py).
+The executable configuration source is [`src/highway_rl/config.py`](src/highway_rl/config.py).
 
-## Installation
+## Quick Start
 
 Python 3.10 or newer is required.
 
@@ -129,7 +117,7 @@ python -m pip install --upgrade pip
 python -m pip install -e ".[dev]"
 ```
 
-## Evaluate the release model
+### Evaluate the Bundled Release Model
 
 ```powershell
 python -m highway_rl.evaluate --algorithm maskable-ppo `
@@ -143,10 +131,9 @@ python -m highway_rl.evaluate --algorithm maskable-ppo `
   --output-dir results/reproduced_test
 ```
 
-The default configuration already contains the v1.0.0 cooldown and overtake
-window, so no command-line override is required.
+The default configuration contains the v1.0.0 cooldown and overtake-window values, so no command-line override is required.
 
-## Train a fresh masked PPO policy
+### Train a Fresh Masked PPO Policy
 
 ```powershell
 python -m highway_rl.train --mask-actions `
@@ -163,22 +150,30 @@ python -m highway_rl.train --mask-actions `
   --log-dir logs/ppo_highway_custom
 ```
 
-The bundled v1.0.0 checkpoint was warm-started from an earlier lateral PPO
-policy and then fine-tuned with true action masking. Training a fresh policy can
-produce different results; evaluate it on both held-out splits before reporting
-metrics.
+The bundled v1.0.0 checkpoint was warm-started from an earlier lateral PPO policy and then fine-tuned with action masking. A fresh training run is not expected to be bit-identical and should be evaluated independently before its metrics are reported.
 
-## Tests
+## Verification
 
 ```bash
 python -m pytest -q
 ```
 
-The test suite covers environment registration, observation/action dimensions,
-reward timing, emergency speed control, action masks, overtake accounting, and
-lane-change cooldown behaviour.
+The repository contains 21 pytest tests covering environment registration, observation/action dimensions, longitudinal-control behavior, reward timing, action masks, overtake accounting, lane-change cooldown behavior, evaluation provenance, and result serialization.
 
-## Project structure
+## Reproducibility
+
+The stable evaluation artifact is:
+
+```text
+models/ppo_highway_v1.0.0.zip
+SHA-256: 38969cd8dc3343d7be26751b9da4fb676f0af4d29031c6401ad83938663dcda8
+```
+
+The checksum is recorded in [`results/v1.0.0/SHA256SUMS.txt`](results/v1.0.0/SHA256SUMS.txt). Development seeds 3000–3019 were used during iteration and are not reported as final evidence; the final validation and test splits use seeds 5000–5099 and 9000–9099, respectively.
+
+Version v1.0.1 is a software-maintenance baseline built on the same evaluated v1.0.0 model and result artifacts. It does not retroactively modify the historical v1.0.0 tag or benchmark values.
+
+## Repository Structure
 
 ```text
 highway-rl-lane-change-decision/
@@ -195,17 +190,18 @@ highway-rl-lane-change-decision/
 │   ├── environment.py
 │   ├── evaluate.py
 │   └── train.py
-└── tests/test_environment.py
+└── tests/
+    ├── test_environment.py
+    └── test_evaluate.py
 ```
 
-## Limitations
+## Scope and Limitations
 
-- The 50–52% strict overtake success rate is below the 70% stretch target.
-- Safety is produced by the complete hybrid system, not by PPO alone.
-- The evaluation covers highway-env simulation, not perception errors,
-  high-fidelity vehicle dynamics, hardware latency, or real-road validation.
-- The reported percentages are estimates from 100 episodes per held-out split,
-  not real-world safety guarantees.
+- The 50–52% strict overtake success rate remains below the 70% stretch target.
+- Safety metrics describe the complete hybrid system, not Maskable PPO in isolation.
+- The evaluation covers `highway-env` simulation rather than perception errors, high-fidelity vehicle dynamics, hardware latency, or real-road validation.
+- The reported percentages are estimates from 100 episodes per held-out split and are not real-world safety guarantees.
+- The bundled checkpoint was warm-started; fresh training runs can produce different policies and metrics.
 
 ## License
 

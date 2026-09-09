@@ -1,12 +1,10 @@
-# Model card — `ppo_highway_v1.0.0`
+# Model Card — `ppo_highway_v1.0.0`
 
-## Intended use
+## Intended Use
 
-This model studies high-level highway lane-change decisions in simulation. It
-selects `LANE_LEFT`, `KEEP_LANE`, or `LANE_RIGHT`. Longitudinal speed control and
-the safety boundary are deterministic. It is not intended for real-vehicle use.
+This model studies high-level highway lane-change decisions in simulation. It selects `LANE_LEFT`, `KEEP_LANE`, or `LANE_RIGHT`; longitudinal speed control and execution constraints are deterministic. It is not intended for real-vehicle deployment.
 
-## Model and training
+## Model and Training
 
 | Item | Value |
 |---|---|
@@ -25,21 +23,18 @@ the safety boundary are deterministic. It is not intended for real-vehicle use.
 | PPO epochs / clip range | 10 / 0.2 |
 | Seed / device | 42 / CPU |
 
-The release environment uses an 8-decision lane-change cooldown and an 8-step
-overtake window. The checkpoint weights were not retrained for this parameter
-change; the cooldown is an explicit execution constraint.
+The evaluated environment uses an 8-decision lane-change cooldown and an 8-step overtake window. The checkpoint weights were not retrained for this execution-constraint change; the cooldown is enforced deterministically at runtime.
 
-## Evaluation protocol
+## Evaluation Protocol
 
-Evaluation is deterministic. Development seeds 3000–3019 were used while
-iterating and are not reported as final evidence.
+Evaluation is deterministic. Development seeds 3000–3019 were used during iteration and are not reported as final evidence.
 
 | Split | Seeds | Episodes | Role |
 |---|---:|---:|---|
 | Validation | 5000–5099 | 100 | Independent validation |
 | Test | 9000–9099 | 100 | Held-out final test |
 
-## Results
+## Key Results
 
 | Metric | Validation | Test | Target |
 |---|---:|---:|---:|
@@ -54,25 +49,30 @@ iterating and are not reported as final evidence.
 | Unavailable-action requests | **0.0%** | **0.0%** | 0% |
 | Superseded attempts | **0** | **0** | 0 |
 
-Validation contained one lane-change contact. Test contained one rear-end by a
-follower and one lane-change contact; there were no ego-to-leader rear-ends in
-either held-out set.
+Validation contained one lane-change contact. Test contained one rear-end by a follower and one lane-change contact; there were no ego-to-leader rear-end collisions in either held-out split.
 
 ## Interpretation
 
-The model meets the collision, completion, speed, lane-change-frequency, and
-constraint-intervention targets on both held-out sets. Matching cooldown and
-overtake-window lengths removes mid-pass abandonment without changing policy
-weights. This is a system-level result: the learned lateral policy, rule-based
-speed controller, action mask, and safety shield all contribute.
+The hybrid system meets its collision, completion, speed, lane-change-frequency, and constraint-intervention targets on both held-out sets. Matching cooldown and overtake-window lengths prevents mid-pass abandonment without changing policy weights. These are system-level results: the learned lateral policy, deterministic speed controller, action mask, and safety shield all contribute.
+
+## Reproducibility
+
+The evaluated model artifact is `models/ppo_highway_v1.0.0.zip` with SHA-256:
+
+```text
+38969cd8dc3343d7be26751b9da4fb676f0af4d29031c6401ad83938663dcda8
+```
+
+The checksum is also stored in `results/v1.0.0/SHA256SUMS.txt`.
+
+Repository version 1.0.1 is a software-maintenance update built around the same evaluated v1.0.0 model and result artifacts. It does not modify this checkpoint or retroactively change the historical benchmark values.
 
 ## Limitations
 
 - Strict overtake success remains below the 70% stretch target.
-- The checkpoint was warm-started; the bundled binary is the exact evaluated
-  artifact, while a fresh training run is not expected to be bit-identical.
-- highway-env does not model production perception, actuation, or road risk.
-- Two 100-episode splits do not establish real-world safety.
+- The checkpoint was warm-started; a fresh training run is not expected to be bit-identical.
+- `highway-env` does not model production perception, actuation, hardware latency, or real-road risk.
+- Two 100-episode held-out splits do not establish real-world safety.
 
 ## Evidence
 
