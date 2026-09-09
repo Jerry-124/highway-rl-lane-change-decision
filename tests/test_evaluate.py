@@ -1,11 +1,21 @@
+from __future__ import annotations
+
 import csv
 import json
 
+import numpy as np
 import pytest
 
 from highway_rl.config import ACTION_NAMES, ENV_CONFIG
 from highway_rl.environment import OVERTAKE_OUTCOMES
-from highway_rl.evaluate import EpisodeMetrics, save_results, summarize
+from highway_rl.evaluate import (
+    EpisodeMetrics,
+    _current_action_mask,
+    _EpisodeAccumulator,
+    _select_action,
+    save_results,
+    summarize,
+)
 
 
 def _row(*, steps: int, expected_steps: int) -> EpisodeMetrics:
@@ -121,3 +131,63 @@ def test_save_results_refactor_preserves_csv_and_summary_schema(tmp_path) -> Non
     assert records[0][f"share_{ACTION_NAMES[0]}"] == "0.25"
     assert records[0][f"available_{ACTION_NAMES[0]}"] == "0.75"
     assert records[0][f"outcome_{OVERTAKE_OUTCOMES[0]}"] == "2"
+
+
+def test_action_mask_is_read_from_environment_not_observation_tail() -> None:
+    class Unwrapped:
+        @staticmethod
+        def action_mask():
+            return np.array([True, False, True])
+
+    class Env:
+        unwrapped = Unwrapped()
+
+    mask = _current_action_mask(Env())
+
+    assert mask.tolist() == [True, False, True]
+
+
+def test_select_action_passes_environment_mask_to_maskable_policy() -> None:
+    class Unwrapped:
+        @staticmethod
+        def action_mask():
+            return np.array([True, False, True])
+
+    class Env:
+        unwrapped = Unwrapped()
+
+    class Policy:
+        def __init__(self) -> None:
+            self.kwargs = None
+
+        def predict(self, observation, deterministic=True, **kwargs):
+            self.kwargs = kwargs
+            return np.array([0]), None
+
+    policy = Policy()
+    accumulator = _EpisodeAccumulator(previous_lane=0, expected_steps=1)
+    action = _select_action(
+        policy,
+        np.array([123.0, 456.0]),
+        Env(),
+        True,
+        accumulator,
+    )
+
+    assert action == 0
+    assert policy.kwargs is not None
+    assert policy.kwargs["action_masks"].tolist() == [True, False, True]
+
+
+def test_empty_summary_and_save_are_rejected(tmp_path) -> None:
+    with pytest.raises(ValueError, match="empty"):
+        summarize([])
+    with pytest.raises(ValueError, match="empty"):
+        save_results([], tmp_path)
+
+
+def test_metadata_cannot_overwrite_computed_metrics(tmp_path) -> None:
+    row = _row(steps=10, expected_steps=10)
+
+    with pytest.raises(ValueError, match="episodes"):
+        save_results([row], tmp_path, metadata={"episodes": 999})

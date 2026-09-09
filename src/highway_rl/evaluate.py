@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -14,12 +15,13 @@ import numpy as np
 from sb3_contrib import MaskablePPO
 from stable_baselines3 import PPO
 
+from highway_rl import __version__
 from highway_rl.config import ACTION_NAMES, SEED_SPLITS, apply_overrides
 from highway_rl.environment import OVERTAKE_OUTCOMES, make_env
 
 
 class Policy(Protocol):
-    def predict(self, observation: np.ndarray, deterministic: bool = True): ...
+    def predict(self, observation: np.ndarray, deterministic: bool = True, **kwargs): ...
 
 
 KEEP_LANE = ACTION_NAMES.index("KEEP_LANE")
@@ -86,11 +88,11 @@ class _EpisodeAccumulator:
 
     def record_action_mask(self, action_mask: np.ndarray) -> None:
         for index, available in enumerate(action_mask):
-            self.availability_counts[index] += int(available > 0.5)
+            self.availability_counts[index] += int(bool(available))
 
     def record_requested_action(self, action: int, action_mask: np.ndarray) -> None:
         self.action_counts[action] += 1
-        self.unavailable_requests += int(action_mask[action] <= 0.5)
+        self.unavailable_requests += int(not bool(action_mask[action]))
 
     def record_transition(self, env, reward: float, info: dict) -> None:
         self.steps += 1
@@ -106,6 +108,8 @@ class _EpisodeAccumulator:
         self.overtake_attempts += int(bool(info.get("overtake_attempt_started", False)))
         outcome = info.get("overtake_outcome")
         if outcome is not None:
+            if outcome not in self.outcomes:
+                raise ValueError(f"unknown overtake outcome {outcome!r}")
             self.outcomes[outcome] += 1
         self.superseded += int(bool(info.get("overtake_superseded", False)))
         current_lane = _lane_id(env)
@@ -151,7 +155,7 @@ def _lane_id(env) -> int:
 
 
 def _nearest(road, vehicle, lane_index, ahead: bool):
-    """(gap, vehicle) of the nearest vehicle ahead of / behind the ego."""
+    """Return the nearest vehicle and gap ahead of or behind the ego."""
     lane = road.network.get_lane(lane_index)
     s_self = lane.local_coordinates(vehicle.position)[0]
     best_gap = float("inf")
@@ -190,21 +194,47 @@ def _expected_episode_steps(env) -> int:
     )
 
 
+def _current_action_mask(env) -> np.ndarray:
+    """Read action availability from the environment, not observation layout."""
+    provider = getattr(env, "action_masks", None)
+    if callable(provider):
+        mask = provider()
+    else:
+        unwrapped_provider = getattr(env.unwrapped, "action_mask", None)
+        if not callable(unwrapped_provider):
+            raise TypeError("environment does not expose a callable action-mask provider")
+        mask = unwrapped_provider()
+
+    action_mask = np.asarray(mask, dtype=bool).reshape(-1)
+    expected_shape = (len(ACTION_NAMES),)
+    if action_mask.shape != expected_shape:
+        raise ValueError(
+            f"action mask has shape {action_mask.shape}, expected {expected_shape}"
+        )
+    if not np.any(action_mask):
+        raise ValueError("action mask must leave at least one action available")
+    return action_mask
+
+
 def _select_action(
     policy: Policy,
     observation: np.ndarray,
+    env,
     use_action_masks: bool,
     accumulator: _EpisodeAccumulator,
 ) -> int:
-    action_mask = np.asarray(observation[-len(ACTION_NAMES) :])
+    action_mask = _current_action_mask(env)
     accumulator.record_action_mask(action_mask)
-    predict_kwargs = (
-        {"action_masks": action_mask.astype(bool)} if use_action_masks else {}
-    )
+    predict_kwargs = {"action_masks": action_mask} if use_action_masks else {}
     action, _ = policy.predict(observation, deterministic=True, **predict_kwargs)
-    action = int(action)
-    accumulator.record_requested_action(action, action_mask)
-    return action
+    action_array = np.asarray(action)
+    if action_array.size != 1:
+        raise ValueError(f"policy returned {action_array.size} actions for one environment")
+    action_index = int(action_array.item())
+    if not 0 <= action_index < len(ACTION_NAMES):
+        raise ValueError(f"policy returned out-of-range action {action_index}")
+    accumulator.record_requested_action(action_index, action_mask)
+    return action_index
 
 
 def _evaluate_episode(
@@ -224,6 +254,7 @@ def _evaluate_episode(
         action = _select_action(
             policy,
             observation,
+            env,
             use_action_masks,
             accumulator,
         )
@@ -240,6 +271,11 @@ def evaluate(
     use_action_masks: bool = False,
     env=None,
 ) -> list[EpisodeMetrics]:
+    if isinstance(episodes, bool) or not isinstance(episodes, int) or episodes < 1:
+        raise ValueError("episodes must be a positive integer")
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise ValueError("seed must be a non-negative integer")
+
     # `env` lets a caller hand in an environment the policy is already bound
     # to, which is how rule-based baselines use the same metric pipeline.
     owns_env = env is None
@@ -295,6 +331,9 @@ def _overtake_accounting(rows: list[EpisodeMetrics]) -> tuple[int, int, bool]:
 
 
 def summarize(rows: list[EpisodeMetrics]) -> dict[str, object]:
+    if not rows:
+        raise ValueError("cannot summarize an empty episode list")
+
     rewards = [row.cumulative_reward for row in rows]
     steps = _sum_metric(rows, "steps") or 1
     episodes = len(rows)
@@ -347,9 +386,7 @@ def summarize(rows: list[EpisodeMetrics]) -> dict[str, object]:
 
 
 def _episode_columns(row: EpisodeMetrics) -> list[str]:
-    columns = [
-        key for key in asdict(row) if key not in SERIALIZED_MAPPING_FIELDS
-    ]
+    columns = [key for key in asdict(row) if key not in SERIALIZED_MAPPING_FIELDS]
     columns.extend(f"share_{name}" for name in ACTION_NAMES)
     columns.extend(f"available_{name}" for name in ACTION_NAMES)
     columns.extend(f"outcome_{name}" for name in OVERTAKE_OUTCOMES)
@@ -362,9 +399,7 @@ def _episode_record(row: EpisodeMetrics) -> dict[str, object]:
         for key, value in asdict(row).items()
         if key not in SERIALIZED_MAPPING_FIELDS
     }
-    record.update(
-        {f"share_{name}": share for name, share in row.action_mix.items()}
-    )
+    record.update({f"share_{name}": share for name, share in row.action_mix.items()})
     record.update(
         {
             f"available_{name}": share
@@ -397,13 +432,40 @@ def save_results(
     *,
     metadata: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        raise ValueError("cannot save an empty episode list")
+
     summary = summarize(rows)
     if metadata:
+        overlap = sorted(set(summary).intersection(metadata))
+        if overlap:
+            raise ValueError(
+                "metadata must not overwrite computed metrics: " + ", ".join(overlap)
+            )
         summary.update(metadata)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
     _write_episode_csv(rows, output_dir / "episodes.csv")
     _write_summary(summary, output_dir / "summary.json")
     return summary
+
+
+def _resolve_model_artifact(path: Path) -> Path:
+    if path.is_file():
+        return path
+    if path.suffix != ".zip":
+        zipped = path.with_suffix(".zip")
+        if zipped.is_file():
+            return zipped
+    raise FileNotFoundError(f"model artifact not found: {path}")
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def parse_args() -> argparse.Namespace:
@@ -438,11 +500,16 @@ def main() -> None:
         seed, episodes = SEED_SPLITS[args.split]
     else:
         seed, episodes = args.seed, args.episodes
+
     if episodes < 1:
         raise ValueError("episodes must be at least 1")
+    if seed < 0:
+        raise ValueError("seed must be non-negative")
+
     overrides = apply_overrides(args.set)
+    model_path = _resolve_model_artifact(args.model_path)
     algorithm = MaskablePPO if args.algorithm == "maskable-ppo" else PPO
-    model = algorithm.load(args.model_path, device="cpu")
+    model = algorithm.load(model_path, device="cpu")
     rows = evaluate(
         model,
         episodes,
@@ -453,6 +520,10 @@ def main() -> None:
         rows,
         args.output_dir,
         metadata={
+            "software_version": __version__,
+            "algorithm": args.algorithm,
+            "model_path": str(model_path),
+            "model_sha256": _sha256_file(model_path),
             "seed_split": args.split or "custom",
             "seed_start": seed,
             "config_overrides": overrides,

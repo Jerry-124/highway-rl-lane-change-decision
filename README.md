@@ -2,7 +2,8 @@
 
 [![Version](https://img.shields.io/badge/version-v1.0.1-blueviolet)](CHANGELOG.md)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](#quick-start)
-[![Tests](https://img.shields.io/badge/tests-21-brightgreen)](#verification)
+[![CI](https://github.com/Jerry-124/highway-rl-lane-change-decision/actions/workflows/ci.yml/badge.svg)](https://github.com/Jerry-124/highway-rl-lane-change-decision/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-35-brightgreen)](#verification)
 
 A reproducible simulation research project for high-level highway lane-change decision making with Maskable PPO, deterministic longitudinal control, action masking, and explicit execution constraints in `highway-env`.
 
@@ -16,6 +17,7 @@ A reproducible simulation research project for high-level highway lane-change de
 - **Commitment constraint:** the lane-change cooldown matches the overtake window, preventing a new manoeuvre from silently replacing an active overtake attempt.
 - **Held-out evaluation:** the bundled v1.0.0 checkpoint is evaluated on independent 100-episode validation and test splits.
 - **Traceable artifacts:** raw episode records, summaries, a model card, and a SHA-256 checksum are committed with the release model.
+- **Validated experiment interfaces:** configuration overrides are typed and transactional, evaluation reads action availability from the environment rather than observation layout, and new summaries record model/software provenance automatically.
 
 ## System Architecture
 
@@ -26,9 +28,7 @@ A reproducible simulation research project for high-level highway lane-change de
 | Action mask / safety shield | Reject unsafe or unavailable lane changes | No |
 | Commitment constraint | Prevent a new manoeuvre during the overtake window | No |
 
-The observation contains 53 values: 10 nearby vehicles × 5 normalized kinematic features, followed by 3 action-availability flags.
-
-The three-action lateral policy keeps high-level lane selection separate from longitudinal speed control. Earlier joint speed-and-lane experiments are not part of the stable public baseline.
+The observation contains 53 values in the stable masked configuration: 10 nearby vehicles × 5 normalized kinematic features, followed by 3 action-availability flags. Evaluation does not depend on those flags being at a hard-coded observation position; it queries the environment's action-mask interface directly.
 
 ## Key Results
 
@@ -78,18 +78,7 @@ Evidence is stored in [`results/v1.0.0_validation`](results/v1.0.0_validation), 
 | Short headway | -0.5 |
 | Alive reward | 0.0 |
 
-### Maskable PPO
-
-| Parameter | Value |
-|---|---:|
-| Network | MLP `[256, 256]` |
-| `gamma` / `gae_lambda` | 0.99 / 0.95 |
-| Learning rate | 1e-4 for final masked fine-tuning |
-| Entropy coefficient | 0.01 |
-| PPO epochs / clip range | 10 / 0.2 |
-| `n_steps` / batch size | 256 / 256 |
-
-The executable configuration source is [`src/highway_rl/config.py`](src/highway_rl/config.py).
+The executable configuration source is [`src/highway_rl/config.py`](src/highway_rl/config.py). Command-line `--set KEY=VALUE` overrides are parsed according to the existing value type and validated transactionally, so inputs such as `shield_enabled=false` become the boolean `False` rather than the truthy string `"false"`.
 
 ## Quick Start
 
@@ -131,7 +120,7 @@ python -m highway_rl.evaluate --algorithm maskable-ppo `
   --output-dir results/reproduced_test
 ```
 
-The default configuration contains the v1.0.0 cooldown and overtake-window values, so no command-line override is required.
+Newly generated `summary.json` files include the software version, algorithm, resolved model path, model SHA-256, seed provenance, and applied configuration overrides in addition to the computed metrics.
 
 ### Train a Fresh Masked PPO Policy
 
@@ -150,15 +139,20 @@ python -m highway_rl.train --mask-actions `
   --log-dir logs/ppo_highway_custom
 ```
 
+Training arguments are validated before environments or model state are created. Invalid counts, non-finite hyperparameters, incompatible batch geometry, missing resume artifacts, and `--reset-critic` without `--resume-from` fail explicitly.
+
 The bundled v1.0.0 checkpoint was warm-started from an earlier lateral PPO policy and then fine-tuned with action masking. A fresh training run is not expected to be bit-identical and should be evaluated independently before its metrics are reported.
 
 ## Verification
 
 ```bash
 python -m pytest -q
+python -m ruff check .
 ```
 
-The repository contains 21 pytest tests covering environment registration, observation/action dimensions, longitudinal-control behavior, reward timing, action masks, overtake accounting, lane-change cooldown behavior, evaluation provenance, and result serialization.
+The repository contains 35 pytest tests covering environment registration, observation/action dimensions, longitudinal-control behavior, reward timing, action masks, overtake accounting, lane-change cooldown behavior, configuration override semantics, training-argument validation, evaluation provenance, and result serialization.
+
+GitHub Actions runs on Python 3.10 and 3.12 and checks dependency consistency, source/test compilation, the complete pytest suite, and Ruff linting.
 
 ## Reproducibility
 
@@ -171,12 +165,13 @@ SHA-256: 38969cd8dc3343d7be26751b9da4fb676f0af4d29031c6401ad83938663dcda8
 
 The checksum is recorded in [`results/v1.0.0/SHA256SUMS.txt`](results/v1.0.0/SHA256SUMS.txt). Development seeds 3000–3019 were used during iteration and are not reported as final evidence; the final validation and test splits use seeds 5000–5099 and 9000–9099, respectively.
 
-Version v1.0.1 is a software-maintenance baseline built on the same evaluated v1.0.0 model and result artifacts. It does not retroactively modify the historical v1.0.0 tag or benchmark values.
+Version v1.0.1 is a software-maintenance baseline built on the same evaluated v1.0.0 model and result artifacts. It does not retroactively modify the v1.0.0 benchmark values.
 
 ## Repository Structure
 
 ```text
 highway-rl-lane-change-decision/
+├── .github/workflows/ci.yml
 ├── models/ppo_highway_v1.0.0.zip
 ├── results/
 │   ├── v1.0.0/MODEL_CARD.md
@@ -191,8 +186,10 @@ highway-rl-lane-change-decision/
 │   ├── evaluate.py
 │   └── train.py
 └── tests/
+    ├── test_config.py
     ├── test_environment.py
-    └── test_evaluate.py
+    ├── test_evaluate.py
+    └── test_train.py
 ```
 
 ## Scope and Limitations
