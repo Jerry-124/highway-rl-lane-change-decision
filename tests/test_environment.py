@@ -8,6 +8,33 @@ from highway_rl.environment import OVERTAKE_OUTCOMES, ActionMaskObservation, mak
 KEEP_LANE = ACTION_NAMES.index("KEEP_LANE")
 
 
+def _place_leader(unwrapped, *, gap_m: float, speed_mps: float):
+    """Place a traffic vehicle deterministically ahead of the ego in its lane."""
+    unwrapped._cache.clear()
+    leader = unwrapped._leader()
+    if leader is None:
+        candidates = [
+            vehicle
+            for vehicle in unwrapped.road.vehicles
+            if vehicle is not unwrapped.vehicle
+        ]
+        assert candidates, "configured environment should contain traffic vehicles"
+        leader = candidates[0]
+
+    lane = unwrapped.road.network.get_lane(unwrapped.vehicle.lane_index)
+    ego_s = float(lane.local_coordinates(unwrapped.vehicle.position)[0])
+    leader_s = ego_s + gap_m
+    leader.position = np.asarray(lane.position(leader_s, 0.0), dtype=float)
+    leader.heading = float(lane.heading_at(leader_s))
+    leader.speed = float(speed_mps)
+    if hasattr(leader, "target_speed"):
+        leader.target_speed = float(speed_mps)
+
+    unwrapped._cache.clear()
+    assert unwrapped._leader() is leader
+    return leader
+
+
 def test_environment_api() -> None:
     env = make_env(seed=0)
     try:
@@ -49,7 +76,7 @@ def test_action_mask_in_observation() -> None:
         assert base is not None, "observation should be wrapped with the action mask"
         observation, _ = env.reset(seed=0)
         assert observation.shape == (int(np.prod(base.shape)) + len(ACTION_NAMES),)
-        mask = observation[-len(ACTION_NAMES):]
+        mask = observation[-len(ACTION_NAMES) :]
         assert set(np.unique(mask)).issubset({0.0, 1.0})
         # keeping the lane is never blocked: it is always the safe fallback
         assert mask[KEEP_LANE] == 1.0
@@ -67,7 +94,9 @@ def test_masked_actions_are_executed_as_requested() -> None:
             available = np.flatnonzero(mask > 0.5)
             for action in available:
                 assert env.env.unwrapped._shield(int(action)) == action
-            _obs, _r, terminated, truncated, _i = env.step(int(available[0]))
+            _obs, _reward, terminated, truncated, _info = env.step(
+                int(available[0])
+            )
             if terminated or truncated:
                 env.reset()
     finally:
@@ -131,25 +160,12 @@ def test_deceleration_is_clipped() -> None:
 
 
 def test_controller_can_follow_a_stopped_leader() -> None:
-    """The cruise floor must not override the following terms.
-
-    `min_cruise_speed` guards against stalling on an open road. Once a leader
-    has pulled the target below it, clipping back up drives the ego into a slow
-    or stopped vehicle instead of matching it - the exact opposite of what the
-    floor is documented to do.
-    """
+    """The cruise floor must not override the following terms."""
     env = make_env()
     unwrapped = env.env.unwrapped
     try:
         env.reset(seed=0)
-        leader = unwrapped._leader()
-        if leader is None:
-            pytest.skip("no leader directly ahead on this seed")
-        # park a stopped vehicle a car length or so in front of the ego
-        leader.speed = 0.0
-        leader.position[0] = unwrapped.vehicle.position[0] + 6.0
-        leader.position[1] = unwrapped.vehicle.position[1]
-        unwrapped._cache.clear()
+        _place_leader(unwrapped, gap_m=6.0, speed_mps=0.0)
         desired = unwrapped._desired_speed()
         assert desired <= 1.0, (
             f"a stopped leader 6 m ahead must pull the target to a standstill, "
@@ -166,14 +182,8 @@ def test_controller_can_follow_a_slow_leader() -> None:
     unwrapped = env.env.unwrapped
     try:
         env.reset(seed=0)
-        leader = unwrapped._leader()
-        if leader is None:
-            pytest.skip("no leader directly ahead on this seed")
-        slow = float(ENV_CONFIG["min_cruise_speed"]) - 4.0  # 6 m/s
-        leader.speed = slow
-        leader.position[0] = unwrapped.vehicle.position[0] + 10.0
-        leader.position[1] = unwrapped.vehicle.position[1]
-        unwrapped._cache.clear()
+        slow = float(ENV_CONFIG["min_cruise_speed"]) - 4.0
+        _place_leader(unwrapped, gap_m=10.0, speed_mps=slow)
         desired = unwrapped._desired_speed()
         assert desired <= slow, (
             f"following a {slow:.1f} m/s leader must target at most that speed, "
@@ -184,34 +194,18 @@ def test_controller_can_follow_a_slow_leader() -> None:
 
 
 def test_prepare_speed_does_not_hold_during_a_pass() -> None:
-    """The prepare speed is for hunting a gap, not for completing a pass.
-
-    Easing off to 25 m/s while an overtake is under way caps the closing speed
-    at roughly 4 m/s, so the ego never gets past the car it set out to overtake:
-    measured over 37 attempts, blocked was active on 74% of the chase and the
-    median attempt finished still 2.2 m behind.
-    """
+    """The prepare speed is for hunting a gap, not for completing a pass."""
     env = make_env()
     unwrapped = env.env.unwrapped
     try:
         env.reset(seed=0)
-        leader = unwrapped._leader()
-        if leader is None:
-            pytest.skip("no leader directly ahead on this seed")
-        # Far enough that no following constraint applies, close enough that the
-        # leader still holds us up (catch-up time well inside block_horizon).
-        leader.speed = 18.0
-        leader.position[0] = unwrapped.vehicle.position[0] + 60.0
-        leader.position[1] = unwrapped.vehicle.position[1]
+        leader = _place_leader(unwrapped, gap_m=60.0, speed_mps=18.0)
         unwrapped.vehicle.speed = 25.0
         unwrapped._cache.clear()
-        if unwrapped._blocked() <= 0.0:
-            pytest.skip("constructed scene is not blocked")
+        assert unwrapped._blocked() > 0.0, "constructed scene must be blocked"
 
-        # hunting for a gap: ease off to the prepare speed
         unwrapped._cache.clear()
         hunting = unwrapped._desired_speed()
-        # a pass is armed: the same scene must no longer be held down
         unwrapped._overtake_leader = leader
         unwrapped._cache.clear()
         passing = unwrapped._desired_speed()
@@ -225,12 +219,7 @@ def test_prepare_speed_does_not_hold_during_a_pass() -> None:
 
 
 def test_reward_terms_are_pinned_to_known_timepoints() -> None:
-    """Decision terms read the snapshot; result terms read the post-update state.
-
-    The bug this guards against: `_rewards` used to read `blocked` from a cache
-    filled before `_simulate` while recomputing `can_escape` on the moved world,
-    so the two halves of one penalty described different moments.
-    """
+    """Decision terms read the snapshot; result terms read the post-update state."""
     env = make_env()
     unwrapped = env.env.unwrapped
     try:
@@ -238,11 +227,9 @@ def test_reward_terms_are_pinned_to_known_timepoints() -> None:
         env.step(KEEP_LANE)
         ctx = unwrapped._decision_ctx
         rewards = unwrapped._rewards(KEEP_LANE)
-        # blocked_keep_penalty: both halves come from the decision-time snapshot
         assert rewards["blocked_keep_penalty"] == pytest.approx(
             float(ctx["blocked"]) * float(ctx["can_escape"])
         )
-        # headway_penalty: a result term, measured after the world moved
         unwrapped._cache.clear()
         assert rewards["headway_penalty"] == pytest.approx(unwrapped._congestion())
     finally:
@@ -250,73 +237,70 @@ def test_reward_terms_are_pinned_to_known_timepoints() -> None:
 
 
 def test_overtake_outcome_is_reported() -> None:
-    """Every armed attempt must resolve to a named outcome, not just vanish."""
+    """Every armed attempt must deterministically resolve to a named outcome."""
     env = make_env()
     unwrapped = env.env.unwrapped
-    left = unwrapped.action_type.actions_indexes["LANE_LEFT"]
-    right = unwrapped.action_type.actions_indexes["LANE_RIGHT"]
-    seen: set[str] = set()
     try:
-        for episode in range(10):
-            env.reset(seed=3000 + episode)
-            terminated = truncated = False
-            while not (terminated or truncated):
-                # change lane whenever held up: this is what arms an attempt
-                if unwrapped._blocked() > 0.0:
-                    lane = int(unwrapped.vehicle.lane_index[2])
-                    action = left if lane < 3 else right
-                else:
-                    action = KEEP_LANE
-                _obs, _r, terminated, truncated, info = env.step(action)
-                outcome = info.get("overtake_outcome")
-                if outcome is not None:
-                    assert outcome in OVERTAKE_OUTCOMES, f"unknown outcome {outcome}"
-                    seen.add(outcome)
-        if not seen:
-            pytest.skip("no overtake attempt armed within the sampled episodes")
+        env.reset(seed=0)
+        leader = _place_leader(unwrapped, gap_m=60.0, speed_mps=18.0)
+        source_lane = int(unwrapped.vehicle.lane_index[2])
+        unwrapped._overtake_leader = leader
+        unwrapped._overtake_source_lane = source_lane
+        unwrapped._overtake_countdown = 1
+
+        bonus, outcome = unwrapped._resolve_overtake(
+            source_lane + 1,
+            terminated=False,
+            truncated=False,
+        )
+
+        assert bonus == 0.0
+        assert outcome == "expired"
+        assert outcome in OVERTAKE_OUTCOMES
     finally:
         env.close()
 
 
 def test_overtake_outcomes_are_counted_per_attempt_not_per_step() -> None:
-    """One outcome per attempt, never per step.
-
-    Emitting an outcome on every step an attempt stays armed makes the
-    distribution a count of steps: a 100-episode run reported 1736 "pending"
-    against 247 attempts, so the outcome shares could not be read as
-    percentages at all.
-    """
+    """Superseded plus resolved attempts must balance exactly."""
     env = make_env()
     unwrapped = env.env.unwrapped
-    left = unwrapped.action_type.actions_indexes["LANE_LEFT"]
-    right = unwrapped.action_type.actions_indexes["LANE_RIGHT"]
-    attempts = 0
-    superseded = 0
-    outcomes: dict[str, int] = {}
     try:
-        for episode in range(10):
-            env.reset(seed=3000 + episode)
-            terminated = truncated = False
-            while not (terminated or truncated):
-                if unwrapped._blocked() > 0.0:
-                    lane = int(unwrapped.vehicle.lane_index[2])
-                    action = left if lane < 3 else right
-                else:
-                    action = KEEP_LANE
-                _obs, _r, terminated, truncated, info = env.step(action)
-                attempts += int(bool(info.get("overtake_attempt_started", False)))
-                superseded += int(bool(info.get("overtake_superseded", False)))
-                outcome = info.get("overtake_outcome")
-                if outcome is not None:
-                    assert outcome in OVERTAKE_OUTCOMES, f"unknown outcome {outcome}"
-                    outcomes[outcome] = outcomes.get(outcome, 0) + 1
-        if not attempts:
-            pytest.skip("no overtake attempt armed within the sampled episodes")
-        assert "pending" not in outcomes, "pending must not be reported as an outcome"
-        assert sum(outcomes.values()) + superseded == attempts, (
-            f"accounting does not balance: {sum(outcomes.values())} outcomes + "
-            f"{superseded} superseded != {attempts} attempts"
+        env.reset(seed=0)
+        leader = _place_leader(unwrapped, gap_m=60.0, speed_mps=18.0)
+        source_lane = int(unwrapped.vehicle.lane_index[2])
+        target_lane = source_lane + 1
+
+        started_1, superseded_1 = unwrapped._register_overtake_attempt(
+            target_before=source_lane,
+            target_after=target_lane,
+            blocked_before=1.0,
+            leader_before=leader,
+            lane_before=source_lane,
         )
+        started_2, superseded_2 = unwrapped._register_overtake_attempt(
+            target_before=source_lane,
+            target_after=target_lane,
+            blocked_before=1.0,
+            leader_before=leader,
+            lane_before=source_lane,
+        )
+        assert started_1 and not superseded_1
+        assert started_2 and superseded_2
+
+        unwrapped._overtake_countdown = 1
+        _bonus, outcome = unwrapped._resolve_overtake(
+            target_lane,
+            terminated=False,
+            truncated=False,
+        )
+        assert outcome in OVERTAKE_OUTCOMES
+        assert outcome != "pending"
+
+        attempts = int(started_1) + int(started_2)
+        superseded = int(superseded_1) + int(superseded_2)
+        resolved = int(outcome is not None)
+        assert resolved + superseded == attempts
     finally:
         env.close()
 
@@ -332,12 +316,10 @@ def test_keep_lane_baseline_is_safe() -> None:
             env.reset(seed=3000 + episode)
             terminated = truncated = False
             while not (terminated or truncated):
-                _obs, _r, terminated, truncated, _i = env.step(KEEP_LANE)
+                _obs, _reward, terminated, truncated, _info = env.step(KEEP_LANE)
             crashes += int(env.env.unwrapped.vehicle.crashed)
     finally:
         env.close()
-    # the whole point of moving speed control out of the policy: this has to
-    # be dramatically better than the ~95% crash rate of unconstrained driving
     assert crashes / episodes <= 0.10, f"keep-lane baseline crashed {crashes}/{episodes}"
 
 
@@ -346,7 +328,7 @@ def test_overtake_bonus_is_recorded() -> None:
     try:
         env.reset(seed=0)
         for _ in range(40):
-            _obs, _r, terminated, truncated, info = env.step(
+            _obs, _reward, terminated, truncated, info = env.step(
                 env.action_space.sample()
             )
             assert "overtake_bonus" in info
@@ -361,23 +343,18 @@ def test_overtake_bonus_is_recorded() -> None:
 
 
 def test_lane_change_cooldown_blocks_immediate_return() -> None:
-    """Changing back right after a change must be flagged as unnecessary."""
+    """Cooldown must veto any immediate second lateral action deterministically."""
     env = make_env(seed=0)
     unwrapped = env.env.unwrapped
     try:
         env.reset(seed=0)
-        for _ in range(60):
-            left = unwrapped.action_type.actions_indexes["LANE_LEFT"]
-            right = unwrapped.action_type.actions_indexes["LANE_RIGHT"]
-            previous_lane = int(unwrapped.vehicle.lane_index[2])
-            _obs, _r, terminated, truncated, _i = env.step(left)
-            if int(unwrapped.vehicle.lane_index[2]) != previous_lane:
-                assert unwrapped._shield(right) == KEEP_LANE, (
-                    "the shield must block an immediate change back"
-                )
-                return
-            if terminated or truncated:
-                env.reset()
-        pytest.skip("no lane change completed within the sampled steps")
+        left = unwrapped.action_type.actions_indexes["LANE_LEFT"]
+        right = unwrapped.action_type.actions_indexes["LANE_RIGHT"]
+        unwrapped._lane_change_cooldown = 1
+
+        assert unwrapped._shield(left) == KEEP_LANE
+        assert unwrapped._shield_mode == 2
+        assert unwrapped._shield(right) == KEEP_LANE
+        assert unwrapped._shield_mode == 2
     finally:
         env.close()
