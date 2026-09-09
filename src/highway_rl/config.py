@@ -9,6 +9,9 @@ the fixed execution layer beneath the learned lateral policy.
 
 from __future__ import annotations
 
+import copy
+import json
+import math
 from typing import Any
 
 ENV_ID = "highway-rl-v0"
@@ -36,63 +39,33 @@ ENV_CONFIG: dict[str, Any] = {
     "duration": 40,
     "ego_spacing": 2.0,
     # --- reward weights -------------------------------------------------
-    # collision stays at -25 until the contracted scope is validated.
     "collision_reward": -25.0,
-    # efficiency: a good lane choice is what lets the controller run at cruise
     "high_speed_reward": 1.1,
-    # paying per step for merely existing is what made braking optimal
     "alive_reward": 0.0,
     "right_lane_reward": 0.05,
-    # never punish a legal lane change: it is the behaviour we want
     "lane_change_reward": 0.0,
-    # small nudge only; the real lateral signal is the overtake bonus, so that
-    # weaving cannot out-earn overtaking
-    # A safe lane change is not automatically useful.  Masking already makes
-    # exploration safe; only a completed overtake should earn lateral credit.
     "completed_lane_change_reward": 0.0,
     "overtake_reward": 2.0,
     "invalid_lane_change_penalty": -0.5,
     "unnecessary_lane_change_penalty": -0.5,
-    # held the lane while blocked and a safe lane change was available
     "blocked_keep_penalty": -1.0,
-    # asking the shield for something it had to override
-    # The 5k policy still requested unavailable lateral actions on 26.4% of
-    # decisions.  The mask is visible in the observation, so make ignoring it
-    # clearly worse than KEEP_LANE without relaxing the safety boundary.
     "shield_violation_penalty": -0.5,
-    # mild: most following behaviour belongs to the controller, but a good
-    # lane choice should still keep the ego out of tight following
     "headway_penalty": -0.5,
     # --- shaping thresholds ---------------------------------------------
     "safe_time_headway": 1.5,
     "desired_speed": 30.0,
-    # seconds of catch-up time at the desired speed below which the leader is
-    # considered to be holding us up; drives every "blocked" term
     "block_horizon": 8.0,
     # --- rule-based longitudinal controller ------------------------------
     "cruise_speed": 30.0,
     "prepare_speed": 25.0,
-    # absolute standstill guard only; deliberately well below traffic speed so
-    # it can never block the controller from backing off behind a slow leader
     "min_cruise_speed": 10.0,
-    # ease down to the prepare speed while looking for a gap
     "follow_ttc": 5.0,
-    # fall back to the leader's speed, then below it, as the gap tightens
     "emergency_ttc": 2.0,
     # --- overtake event --------------------------------------------------
-    # metres the ego must be ahead of the vehicle it passed
     "overtake_margin": 5.0,
-    # decision steps the pass may take after the manoeuvre was initiated
     "overtake_window": 8,
-    # decision steps before another lane change is allowed
-    # Match the overtake window so a pass cannot be abandoned by immediately
-    # starting another lane change. This commitment constraint eliminated
-    # superseded attempts on both held-out seed sets.
     "lane_change_cooldown": 8,
     # --- safety shield ---------------------------------------------------
-    # Rear traffic is deliberately ignored when judging a merge: following
-    # vehicles run IDM and are expected to brake for us. Only a minimum
-    # geometric clearance is enforced, so we never merge onto a car alongside.
     "shield_enabled": True,
     "shield_ttc": 3.0,
     "shield_gap_front": 20.0,
@@ -100,11 +73,8 @@ ENV_CONFIG: dict[str, Any] = {
     "shield_lookahead": 60.0,
     "shield_min_lane_speed": 22.0,
     # --- observation -----------------------------------------------------
-    # the shield rewrites actions, so the policy must see what is allowed
     "action_mask_observation": True,
     # --- ego dynamics ----------------------------------------------------
-    # ControlledVehicle has no acceleration clip at all, so a large speed
-    # correction becomes an implausible deceleration that invites rear-ends.
     "ego_kp_accel": 1.05,
     "ego_max_accel": 3.0,
     "ego_max_decel": 4.0,
@@ -134,30 +104,148 @@ SEED_SPLITS: dict[str, tuple[int, int]] = {
     "test": (9000, 100),
 }
 
-def apply_overrides(overrides: list[str]) -> dict[str, object]:
-    """Apply `KEY=VALUE` pairs to ENV_CONFIG and return what changed.
 
-    Sweeping a single reward weight or controller constant from the command
-    line keeps an experiment reproducible without editing this file. Numbers
-    are coerced to int or float, anything else stays a string.
+def _finite_number(config: dict[str, Any], key: str) -> float:
+    value = config[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{key} must be a finite number")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{key} must be finite")
+    return number
+
+
+def _require_positive(config: dict[str, Any], key: str) -> None:
+    if _finite_number(config, key) <= 0.0:
+        raise ValueError(f"{key} must be > 0")
+
+
+def _require_nonnegative(config: dict[str, Any], key: str) -> None:
+    if _finite_number(config, key) < 0.0:
+        raise ValueError(f"{key} must be >= 0")
+
+
+def _require_integer(config: dict[str, Any], key: str, *, minimum: int) -> None:
+    value = config[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{key} must be an integer")
+    if value < minimum:
+        raise ValueError(f"{key} must be >= {minimum}")
+
+
+def validate_env_config(config: dict[str, Any]) -> None:
+    """Validate execution-critical configuration without changing it."""
+    for key in (
+        "safe_time_headway",
+        "desired_speed",
+        "block_horizon",
+        "cruise_speed",
+        "prepare_speed",
+        "follow_ttc",
+        "emergency_ttc",
+        "overtake_margin",
+        "shield_ttc",
+        "shield_gap_front",
+        "shield_rear_geometry",
+        "shield_lookahead",
+        "shield_min_lane_speed",
+        "ego_kp_accel",
+        "ego_max_accel",
+        "ego_max_decel",
+        "vehicles_density",
+        "duration",
+    ):
+        _require_positive(config, key)
+
+    _require_nonnegative(config, "min_cruise_speed")
+    _require_integer(config, "lanes_count", minimum=1)
+    _require_integer(config, "vehicles_count", minimum=0)
+    _require_integer(config, "overtake_window", minimum=1)
+    _require_integer(config, "lane_change_cooldown", minimum=0)
+    _require_integer(config, "policy_frequency", minimum=1)
+    _require_integer(config, "simulation_frequency", minimum=1)
+
+    for key in (
+        "shield_enabled",
+        "action_mask_observation",
+        "normalize_reward",
+        "offroad_terminal",
+    ):
+        if not isinstance(config[key], bool):
+            raise TypeError(f"{key} must be a boolean")
+
+    speed_range = config["reward_speed_range"]
+    if not isinstance(speed_range, list) or len(speed_range) != 2:
+        raise TypeError("reward_speed_range must be a two-element list")
+    low, high = speed_range
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        for value in (low, high)
+    ):
+        raise ValueError("reward_speed_range values must be finite numbers")
+    if float(low) >= float(high):
+        raise ValueError("reward_speed_range must be strictly increasing")
+
+    if float(config["min_cruise_speed"]) > float(config["cruise_speed"]):
+        raise ValueError("min_cruise_speed must not exceed cruise_speed")
+    if int(config["simulation_frequency"]) < int(config["policy_frequency"]):
+        raise ValueError("simulation_frequency must be >= policy_frequency")
+
+
+def _parse_override_value(raw: str, current: object) -> object:
+    text = raw.strip()
+    if isinstance(current, bool):
+        normalized = text.lower()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+        raise ValueError(f"expected true or false, got {raw!r}")
+    if isinstance(current, int):
+        return int(text)
+    if isinstance(current, float):
+        value = float(text)
+        if not math.isfinite(value):
+            raise ValueError(f"expected a finite float, got {raw!r}")
+        return value
+    if isinstance(current, str):
+        return text
+    if isinstance(current, list):
+        value = json.loads(text)
+        if not isinstance(value, list):
+            raise ValueError(f"expected a JSON list, got {raw!r}")
+        return value
+    raise TypeError(f"overrides are not supported for {type(current).__name__} values")
+
+
+def apply_overrides(overrides: list[str]) -> dict[str, object]:
+    """Apply validated ``KEY=VALUE`` pairs to ``ENV_CONFIG`` transactionally.
+
+    Values are parsed according to the existing configuration type. In
+    particular, boolean strings are converted to real booleans rather than
+    truthy strings. All requested changes are validated on a copy first; if any
+    item is invalid, ``ENV_CONFIG`` remains unchanged.
     """
+    candidate = copy.deepcopy(ENV_CONFIG)
     applied: dict[str, object] = {}
     for item in overrides:
         if "=" not in item:
             raise ValueError(f"expected KEY=VALUE, got {item!r}")
         key, raw = item.split("=", 1)
         key = key.strip()
-        if key not in ENV_CONFIG:
+        if not key:
+            raise ValueError("override key must not be empty")
+        if key not in candidate:
             raise KeyError(f"{key!r} is not a known ENV_CONFIG entry")
-        value: object = raw.strip()
-        for cast in (int, float):
-            try:
-                value = cast(raw)
-                break
-            except ValueError:
-                continue
-        ENV_CONFIG[key] = value
+        value = _parse_override_value(raw, candidate[key])
+        candidate[key] = value
         applied[key] = value
+
+    validate_env_config(candidate)
+    ENV_CONFIG.clear()
+    ENV_CONFIG.update(candidate)
     return applied
 
 
@@ -175,3 +263,5 @@ ACCEPTANCE: dict[str, Any] = {
     "shield_intervention_rate_max": 0.05,
     "max_deceleration": 4.0,
 }
+
+validate_env_config(ENV_CONFIG)
