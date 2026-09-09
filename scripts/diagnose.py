@@ -28,7 +28,9 @@ def _current_action_mask(env) -> np.ndarray:
     else:
         provider = getattr(env.unwrapped, "action_mask", None)
         if not callable(provider):
-            raise TypeError("environment does not expose a callable action-mask interface")
+            raise TypeError(
+                "environment does not expose a callable action-mask interface"
+            )
         mask = provider()
 
     action_mask = np.asarray(mask, dtype=bool).reshape(-1)
@@ -85,7 +87,9 @@ def rollout(policy, episodes: int, seed: int, use_masks: bool = False) -> dict:
                     )
                 action_index = int(action_array.item())
                 if not 0 <= action_index < len(ACTION_NAMES):
-                    raise ValueError(f"policy returned out-of-range action {action_index}")
+                    raise ValueError(
+                        f"policy returned out-of-range action {action_index}"
+                    )
                 action_counts[ACTION_NAMES[action_index]] += 1
 
                 front_vehicle, _ = unwrapped.road.neighbour_vehicles(
@@ -117,9 +121,7 @@ def rollout(policy, episodes: int, seed: int, use_masks: bool = False) -> dict:
                     term_totals[name] += float(cfg.get(name, 0.0)) * float(value)
                 # The overtake bonus is added in step() rather than in _rewards,
                 # so it is invisible to the decomposition above.
-                term_totals["overtake_reward"] += float(
-                    info.get("overtake_bonus", 0.0)
-                )
+                term_totals["overtake_reward"] += float(info.get("overtake_bonus", 0.0))
 
                 steps_total += 1
                 speeds.append(float(unwrapped.vehicle.speed))
@@ -138,7 +140,9 @@ def rollout(policy, episodes: int, seed: int, use_masks: bool = False) -> dict:
         "steps_total": steps_total,
         "steps_per_episode": steps_total / episodes,
         "collision_rate": collisions / episodes,
-        "action_share": {key: value / total for key, value in action_counts.most_common()},
+        "action_share": {
+            key: value / total for key, value in action_counts.most_common()
+        },
         "action_count": dict(action_counts),
         "reward_per_step": {
             key: value / total for key, value in sorted(term_totals.items())
@@ -153,8 +157,7 @@ def rollout(policy, episodes: int, seed: int, use_masks: bool = False) -> dict:
         ),
         "mean_target_speed": float(np.mean(target_speeds)),
         "lane_distribution": {
-            int(key): value / total
-            for key, value in sorted(Counter(lane_ids).items())
+            int(key): value / total for key, value in sorted(Counter(lane_ids).items())
         },
         "overtake_outcomes": dict(outcome_counts),
         "front_vehicle_share": front_present / total,
@@ -177,7 +180,11 @@ class RandomPolicy:
     ) -> None:
         if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
             raise ValueError("seed must be a non-negative integer")
-        if isinstance(n_actions, bool) or not isinstance(n_actions, int) or n_actions < 1:
+        if (
+            isinstance(n_actions, bool)
+            or not isinstance(n_actions, int)
+            or n_actions < 1
+        ):
             raise ValueError("n_actions must be a positive integer")
         self.rng = np.random.default_rng(seed)
         self.n_actions = n_actions
