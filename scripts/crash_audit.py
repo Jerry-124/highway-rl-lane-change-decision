@@ -31,7 +31,13 @@ class ConstantPolicy:
 
 
 class RandomPolicy:
+    """Reproducible random policy whose RNG advances across all episodes."""
+
     def __init__(self, seed: int = 0, n_actions: int = len(ACTION_NAMES)) -> None:
+        if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+            raise ValueError("seed must be a non-negative integer")
+        if isinstance(n_actions, bool) or not isinstance(n_actions, int) or n_actions < 1:
+            raise ValueError("n_actions must be a positive integer")
         self.rng = np.random.default_rng(seed)
         self.n_actions = n_actions
 
@@ -56,11 +62,20 @@ class LateralHeuristic:
             candidate = unwrapped._target_lane_index(action)
             if not unwrapped._lane_change_safe(candidate):
                 continue
-            _front_v, front_gap, _rear_v, _rear_gap = unwrapped._lane_neighbours(candidate)
+            _front_vehicle, front_gap, _rear_vehicle, _rear_gap = (
+                unwrapped._lane_neighbours(candidate)
+            )
             gain = front_gap - gap_here
             if gain > 20.0 and gain > best_gain and int(candidate[2]) != current:
                 best_gain, best_action = gain, action
         return best_action, None
+
+
+def _validate_audit_args(episodes: int, seed: int) -> None:
+    if isinstance(episodes, bool) or not isinstance(episodes, int) or episodes < 1:
+        raise ValueError("episodes must be a positive integer")
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise ValueError("seed must be a non-negative integer")
 
 
 def _nearest(road, vehicle, lane_index, ahead: bool):
@@ -83,6 +98,7 @@ def _nearest(road, vehicle, lane_index, ahead: bool):
 
 
 def audit(policy_factory, episodes: int, seed: int) -> dict:
+    _validate_audit_args(episodes, seed)
     env = make_env()
     crashes: list[str] = []
     speeds: list[float] = []
@@ -92,16 +108,18 @@ def audit(policy_factory, episodes: int, seed: int) -> dict:
     overtakes = 0
 
     try:
+        policy = policy_factory(env)
         for episode in range(episodes):
-            obs, _ = env.reset(seed=seed + episode)
-            policy = policy_factory(env)
+            observation, _ = env.reset(seed=seed + episode)
             steps = 0
             changes = 0
             previous_lane = int(env.unwrapped.vehicle.lane_index[2])
             terminated = truncated = False
             while not (terminated or truncated):
-                action, _ = policy.predict(obs, deterministic=True)
-                obs, _reward, terminated, truncated, info = env.step(int(action))
+                action, _ = policy.predict(observation, deterministic=True)
+                observation, _reward, terminated, truncated, info = env.step(
+                    int(action)
+                )
                 steps += 1
                 interventions += int(bool(info.get("shield_intervened", False)))
                 overtakes += int(float(info.get("overtake_bonus", 0.0)) > 0.0)
@@ -112,8 +130,18 @@ def audit(policy_factory, episodes: int, seed: int) -> dict:
                 if env.unwrapped.vehicle.crashed:
                     vehicle = env.unwrapped.vehicle
                     road = env.unwrapped.road
-                    front_gap, front = _nearest(road, vehicle, vehicle.lane_index, True)
-                    rear_gap, rear = _nearest(road, vehicle, vehicle.lane_index, False)
+                    front_gap, front = _nearest(
+                        road,
+                        vehicle,
+                        vehicle.lane_index,
+                        True,
+                    )
+                    rear_gap, rear = _nearest(
+                        road,
+                        vehicle,
+                        vehicle.lane_index,
+                        False,
+                    )
                     if front is not None and front_gap < 8.0:
                         crashes.append("ego rear-ended leader")
                     elif rear is not None and rear_gap < 8.0:
@@ -134,15 +162,25 @@ def audit(policy_factory, episodes: int, seed: int) -> dict:
         "mean_lane_changes": float(np.mean(lane_changes)),
         "mean_overtakes": overtakes / episodes,
         "shield_rate": interventions / total_steps,
-        "causes": {c: crashes.count(c) for c in set(crashes)},
+        "causes": {cause: crashes.count(cause) for cause in set(crashes)},
     }
 
 
-def show(name: str, r: dict) -> None:
-    causes = ", ".join(f"{k}={v}" for k, v in sorted(r["causes"].items())) or "none"
-    print(f"{name:<26} coll={r['collision_rate'] * 100:5.1f}% | speed={r['mean_speed']:5.2f} | "
-          f"lc={r['mean_lane_changes']:4.2f} | overtake={r['mean_overtakes']:4.2f} | "
-          f"steps={r['mean_steps']:5.1f} | shield={r['shield_rate'] * 100:4.1f}%")
+def show(name: str, result: dict) -> None:
+    causes = (
+        ", ".join(
+            f"{key}={value}" for key, value in sorted(result["causes"].items())
+        )
+        or "none"
+    )
+    print(
+        f"{name:<26} coll={result['collision_rate'] * 100:5.1f}% | "
+        f"speed={result['mean_speed']:5.2f} | "
+        f"lc={result['mean_lane_changes']:4.2f} | "
+        f"overtake={result['mean_overtakes']:4.2f} | "
+        f"steps={result['mean_steps']:5.1f} | "
+        f"shield={result['shield_rate'] * 100:4.1f}%"
+    )
     print(f"{'':<26} causes: {causes}")
 
 
@@ -158,9 +196,17 @@ def main() -> None:
     else:
         seed, episodes = args.seed, args.episodes
 
+    try:
+        _validate_audit_args(episodes, seed)
+    except ValueError as exc:
+        parser.error(str(exc))
+
     print(f"actions: {ACTION_NAMES}  (speed is rule-based)")
-    print(f"cruise={ENV_CONFIG['cruise_speed']} prepare={ENV_CONFIG['prepare_speed']} "
-          f"decel<={ENV_CONFIG['ego_max_decel']} m/s^2")
+    print(
+        f"cruise={ENV_CONFIG['cruise_speed']} "
+        f"prepare={ENV_CONFIG['prepare_speed']} "
+        f"decel<={ENV_CONFIG['ego_max_decel']} m/s^2"
+    )
     print(f"{episodes} episodes, seeds {seed}+\n")
 
     def const(action: int):
@@ -168,8 +214,10 @@ def main() -> None:
 
     show("Keep-lane baseline", audit(const(KEEP_LANE), episodes, seed))
     show("Lateral heuristic", audit(LateralHeuristic, episodes, seed))
-    show("Random lateral (PPO start)",
-         audit(lambda _e: RandomPolicy(args.seed), episodes, seed))
+    show(
+        "Random lateral (PPO start)",
+        audit(lambda _env: RandomPolicy(seed), episodes, seed),
+    )
     show("Always change left", audit(const(LANE_LEFT), episodes, seed))
 
 
