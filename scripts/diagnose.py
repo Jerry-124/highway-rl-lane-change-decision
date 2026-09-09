@@ -28,7 +28,7 @@ def _current_action_mask(env) -> np.ndarray:
     else:
         provider = getattr(env.unwrapped, "action_mask", None)
         if not callable(provider):
-            raise AttributeError("environment does not expose an action mask")
+            raise TypeError("environment does not expose a callable action-mask interface")
         mask = provider()
 
     action_mask = np.asarray(mask, dtype=bool).reshape(-1)
