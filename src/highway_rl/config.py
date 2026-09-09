@@ -215,7 +215,7 @@ def _parse_override_value(raw: str, current: object) -> object:
     if isinstance(current, list):
         value = json.loads(text)
         if not isinstance(value, list):
-            raise ValueError(f"expected a JSON list, got {raw!r}")
+            raise TypeError(f"expected a JSON list, got {raw!r}")
         return value
     raise TypeError(f"overrides are not supported for {type(current).__name__} values")
 
