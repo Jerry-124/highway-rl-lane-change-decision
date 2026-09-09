@@ -22,7 +22,10 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8,<9"]
+dev = [
+  "pytest>=8,<9",
+  "ruff>=0.6,<1",
+]
 
 [project.scripts]
 highway-train = "highway_rl.train:main"
