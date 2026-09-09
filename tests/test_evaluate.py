@@ -10,8 +10,8 @@ from highway_rl.config import ACTION_NAMES, ENV_CONFIG
 from highway_rl.environment import OVERTAKE_OUTCOMES
 from highway_rl.evaluate import (
     EpisodeMetrics,
-    _EpisodeAccumulator,
     _current_action_mask,
+    _EpisodeAccumulator,
     _select_action,
     save_results,
     summarize,
