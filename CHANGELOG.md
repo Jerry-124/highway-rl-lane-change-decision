@@ -9,16 +9,22 @@
 - Added MIT license/package metadata and repository-hygiene updates that landed after the v1.0.0 tag.
 - Standardized the public README, model-card wording, package description, and version presentation.
 - Aligned project and runtime package versions to 1.0.1.
+- Made `--set KEY=VALUE` configuration overrides type-aware and transactional; boolean values are parsed explicitly and invalid multi-key updates leave the global configuration unchanged.
+- Decoupled evaluation action masks from observation-vector layout by querying the environment mask interface directly.
+- Added explicit validation for training counts, hyperparameter finiteness/ranges, batch geometry, resume artifacts, and critic-reset usage.
+- Added evaluation guards for empty episode sets, invalid action-mask shapes, out-of-range actions, unknown overtake outcomes, and metadata collisions with computed metrics.
+- Added automatic software/model provenance to newly generated evaluation summaries, including software version, algorithm, resolved model path, model SHA-256, seed provenance, and configuration overrides.
+- Added GitHub Actions regression checks on Python 3.10 and 3.12 with dependency validation, compilation, pytest, and Ruff linting.
 
 ### Validation / Key Results
 
-- The repository contains 21 pytest tests covering environment behavior, action masks, longitudinal control, reward timing, overtake accounting, evaluation provenance, and result serialization.
+- The automated suite contains 35 pytest tests covering environment behavior, action masks, longitudinal control, reward timing, overtake accounting, configuration overrides, training-argument validation, evaluation provenance, and result serialization.
 - The bundled `ppo_highway_v1.0.0.zip` model and its held-out validation/test artifacts are unchanged.
 - No policy retraining, reward retuning, benchmark rerun, or historical-result rewrite is part of this patch.
 
 ### Scope
 
-Version 1.0.1 is a software-maintenance and presentation-consistency patch. The historical v1.0.0 model release remains the source of the reported 100-episode validation and 100-episode test results.
+Version 1.0.1 is a software-maintenance, reproducibility, and presentation-consistency patch. The historical v1.0.0 model release remains the source of the reported 100-episode validation and 100-episode test results.
 
 ## [1.0.0] - 2026-08-29
 
