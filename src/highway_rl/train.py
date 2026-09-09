@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from functools import partial
 from pathlib import Path
 
@@ -46,15 +47,14 @@ def parse_args() -> argparse.Namespace:
         choices=("ppo", "maskable-ppo"),
         default="ppo",
         help="algorithm stored in --resume-from; PPO weights can be transferred "
-             "into a new MaskablePPO optimizer",
+        "into a new MaskablePPO optimizer",
     )
     parser.add_argument(
         "--reset-critic",
         action="store_true",
         help="when transferring weights, reinitialise the value network and keep "
-             "the learned actor. Use this after a reward-semantics change: the "
-             "old critic encodes returns that can no longer occur, so every "
-             "advantage estimate would start out biased.",
+        "the learned actor. Use this after a reward-semantics change: the old "
+        "critic encodes returns that can no longer occur.",
     )
     parser.add_argument("--log-dir", type=Path, default=Path("logs"))
     parser.add_argument(
@@ -67,8 +67,7 @@ def parse_args() -> argparse.Namespace:
         "--vec-env",
         choices=("dummy", "subproc"),
         default="subproc",
-        help="subproc runs environments in separate processes (needs this to "
-             "actually use multiple cores); dummy is easier to debug.",
+        help="subproc runs environments in separate processes; dummy is easier to debug.",
     )
     parser.add_argument(
         "--set",
@@ -76,34 +75,59 @@ def parse_args() -> argparse.Namespace:
         metavar="KEY=VALUE",
         default=[],
         help="override ENV_CONFIG entries for this run, e.g. "
-             "--set overtake_reward=5.0 blocked_keep_penalty=-0.25",
+        "--set overtake_reward=5.0 blocked_keep_penalty=-0.25",
     )
     return parser.parse_args()
 
 
 def reset_critic(model) -> None:
-    """Reinitialise the value path and its optimizer state, keeping the actor.
-
-    The actor is a reasonable initialisation regardless of how rewards were
-    defined. The critic is not: it predicts returns under the *previous* reward,
-    and after a semantics change those returns cannot occur any more, which
-    biases every advantage estimate from the first update onwards. Carrying the
-    Adam moments for parameters that were just re randomised would be worse
-    than having no moments at all, so those are dropped too.
-    """
+    """Reinitialise the value path and its optimizer state, keeping the actor."""
     init = partial(type(model.policy).init_weights, gain=1.0)
     model.policy.mlp_extractor.value_net.apply(init)
     model.policy.value_net.apply(init)
     optimizer = getattr(model.policy, "optimizer", None)
     if optimizer is not None:
         optimizer.state.clear()
-    print("reset critic: value network reinitialised, optimizer moments dropped, "
-          "actor weights kept")
+    print(
+        "reset critic: value network reinitialised, optimizer moments dropped, "
+        "actor weights kept"
+    )
+
+
+def _model_artifact_exists(path: Path) -> bool:
+    return path.is_file() or (path.suffix != ".zip" and path.with_suffix(".zip").is_file())
+
+
+def _validate_positive_int(args: argparse.Namespace, name: str) -> None:
+    value = getattr(args, name)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name.replace('_', '-')} must be a positive integer")
 
 
 def _validate_training_args(args: argparse.Namespace) -> None:
+    for name in ("total_timesteps", "n_envs", "n_steps", "batch_size", "n_epochs"):
+        _validate_positive_int(args, name)
+
+    if isinstance(args.checkpoint_every, bool) or not isinstance(args.checkpoint_every, int):
+        raise ValueError("checkpoint-every must be a non-negative integer")
+    if args.checkpoint_every < 0:
+        raise ValueError("checkpoint-every must be a non-negative integer")
+    if isinstance(args.seed, bool) or not isinstance(args.seed, int) or args.seed < 0:
+        raise ValueError("seed must be a non-negative integer")
+
+    if not math.isfinite(args.learning_rate) or args.learning_rate <= 0.0:
+        raise ValueError("learning-rate must be finite and > 0")
+    if not math.isfinite(args.gamma) or not 0.0 < args.gamma <= 1.0:
+        raise ValueError("gamma must be finite and in (0, 1]")
+    if not math.isfinite(args.ent_coef) or args.ent_coef < 0.0:
+        raise ValueError("ent-coef must be finite and >= 0")
+
     if (args.n_steps * args.n_envs) % args.batch_size != 0:
         raise ValueError("batch-size must divide n-steps * n-envs")
+    if args.reset_critic and args.resume_from is None:
+        raise ValueError("reset-critic requires --resume-from")
+    if args.resume_from is not None and not _model_artifact_exists(args.resume_from):
+        raise FileNotFoundError(f"resume model not found: {args.resume_from}")
 
 
 def _make_vector_env(args: argparse.Namespace):
@@ -205,10 +229,10 @@ def _training_callback(args: argparse.Namespace):
 
 def main() -> None:
     args = parse_args()
+    _validate_training_args(args)
     overrides = apply_overrides(args.set)
     if overrides:
         print(f"config overrides: {overrides}")
-    _validate_training_args(args)
 
     vec_env = _make_vector_env(args)
     try:
@@ -223,6 +247,7 @@ def main() -> None:
         print(f"Saved PPO model to {args.model_path.with_suffix('.zip')}")
     finally:
         vec_env.close()
+
 
 if __name__ == "__main__":
     main()
