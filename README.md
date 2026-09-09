@@ -149,12 +149,12 @@ The bundled v1.0.0 checkpoint was warm-started from an earlier lateral PPO polic
 ```bash
 python -m pytest -q
 python -m ruff check .
-python -m ruff format --check .
+python -m ruff format --check scripts tests
 ```
 
 The repository contains 40 pytest tests covering environment registration, observation/action dimensions, longitudinal-control behavior, reward timing, action masks, overtake accounting, lane-change cooldown behavior, configuration override semantics, training-argument validation, evaluation provenance, diagnostic reproducibility, and result serialization. Scenario-sensitive controller and overtake checks use deterministic constructed traffic states instead of skipping when a sampled scene is unsuitable.
 
-GitHub Actions runs on Python 3.10 and 3.12 and checks dependency consistency, source/test/script compilation, the complete pytest suite, Ruff linting, and Ruff formatting. CI installs the CPU build of PyTorch because the regression suite does not require CUDA.
+GitHub Actions runs on Python 3.10 and 3.12 and checks dependency consistency, source/test/script compilation, the complete pytest suite, repository-wide Ruff linting, and Ruff formatting for maintained scripts and tests. CI installs the CPU build of PyTorch because the regression suite does not require CUDA.
 
 ## Reproducibility
 
