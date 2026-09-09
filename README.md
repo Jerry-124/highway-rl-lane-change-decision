@@ -3,7 +3,7 @@
 [![Version](https://img.shields.io/badge/version-v1.0.1-blueviolet)](CHANGELOG.md)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](#quick-start)
 [![CI](https://github.com/Jerry-124/highway-rl-lane-change-decision/actions/workflows/ci.yml/badge.svg)](https://github.com/Jerry-124/highway-rl-lane-change-decision/actions/workflows/ci.yml)
-[![Tests](https://img.shields.io/badge/tests-35-brightgreen)](#verification)
+[![Tests](https://img.shields.io/badge/tests-40-brightgreen)](#verification)
 
 A reproducible simulation research project for high-level highway lane-change decision making with Maskable PPO, deterministic longitudinal control, action masking, and explicit execution constraints in `highway-env`.
 
@@ -18,6 +18,7 @@ A reproducible simulation research project for high-level highway lane-change de
 - **Held-out evaluation:** the bundled v1.0.0 checkpoint is evaluated on independent 100-episode validation and test splits.
 - **Traceable artifacts:** raw episode records, summaries, a model card, and a SHA-256 checksum are committed with the release model.
 - **Validated experiment interfaces:** configuration overrides are typed and transactional, evaluation reads action availability from the environment rather than observation layout, and new summaries record model/software provenance automatically.
+- **Reproducible diagnostics:** auxiliary random baselines use explicit local RNG seeds, and diagnostic action masking also queries the environment interface rather than relying on observation layout.
 
 ## System Architecture
 
@@ -148,11 +149,12 @@ The bundled v1.0.0 checkpoint was warm-started from an earlier lateral PPO polic
 ```bash
 python -m pytest -q
 python -m ruff check .
+python -m ruff format --check .
 ```
 
-The repository contains 35 pytest tests covering environment registration, observation/action dimensions, longitudinal-control behavior, reward timing, action masks, overtake accounting, lane-change cooldown behavior, configuration override semantics, training-argument validation, evaluation provenance, and result serialization.
+The repository contains 40 pytest tests covering environment registration, observation/action dimensions, longitudinal-control behavior, reward timing, action masks, overtake accounting, lane-change cooldown behavior, configuration override semantics, training-argument validation, evaluation provenance, diagnostic reproducibility, and result serialization. Scenario-sensitive controller and overtake checks use deterministic constructed traffic states instead of skipping when a sampled scene is unsuitable.
 
-GitHub Actions runs on Python 3.10 and 3.12 and checks dependency consistency, source/test compilation, the complete pytest suite, and Ruff linting.
+GitHub Actions runs on Python 3.10 and 3.12 and checks dependency consistency, source/test/script compilation, the complete pytest suite, Ruff linting, and Ruff formatting. CI installs the CPU build of PyTorch because the regression suite does not require CUDA.
 
 ## Reproducibility
 
@@ -187,6 +189,7 @@ highway-rl-lane-change-decision/
 │   └── train.py
 └── tests/
     ├── test_config.py
+    ├── test_diagnostics.py
     ├── test_environment.py
     ├── test_evaluate.py
     └── test_train.py
