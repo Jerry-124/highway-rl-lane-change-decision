@@ -109,7 +109,7 @@ def _validate_training_args(args: argparse.Namespace) -> None:
         _validate_positive_int(args, name)
 
     if isinstance(args.checkpoint_every, bool) or not isinstance(args.checkpoint_every, int):
-        raise ValueError("checkpoint-every must be a non-negative integer")
+        raise TypeError("checkpoint-every must be a non-negative integer")
     if args.checkpoint_every < 0:
         raise ValueError("checkpoint-every must be a non-negative integer")
     if isinstance(args.seed, bool) or not isinstance(args.seed, int) or args.seed < 0:
