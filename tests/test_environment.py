@@ -72,7 +72,11 @@ def test_action_space_is_lateral_only() -> None:
 def test_action_mask_in_observation() -> None:
     env = make_env(seed=0)
     try:
-        base = env.env.observation_space if isinstance(env, ActionMaskObservation) else None
+        base = (
+            env.env.observation_space
+            if isinstance(env, ActionMaskObservation)
+            else None
+        )
         assert base is not None, "observation should be wrapped with the action mask"
         observation, _ = env.reset(seed=0)
         assert observation.shape == (int(np.prod(base.shape)) + len(ACTION_NAMES),)
@@ -94,9 +98,7 @@ def test_masked_actions_are_executed_as_requested() -> None:
             available = np.flatnonzero(mask > 0.5)
             for action in available:
                 assert env.env.unwrapped._shield(int(action)) == action
-            _obs, _reward, terminated, truncated, _info = env.step(
-                int(available[0])
-            )
+            _obs, _reward, terminated, truncated, _info = env.step(int(available[0]))
             if terminated or truncated:
                 env.reset()
     finally:
@@ -152,8 +154,9 @@ def test_deceleration_is_clipped() -> None:
         env.reset(seed=0)
         command = unwrapped.vehicle.speed_control(ENV_CONFIG["min_cruise_speed"])
         assert command >= -ENV_CONFIG["ego_max_decel"]
-        assert unwrapped.vehicle.speed_control(ENV_CONFIG["cruise_speed"]) <= (
-            ENV_CONFIG["ego_max_accel"]
+        assert (
+            unwrapped.vehicle.speed_control(ENV_CONFIG["cruise_speed"])
+            <= (ENV_CONFIG["ego_max_accel"])
         )
     finally:
         env.close()
@@ -320,7 +323,9 @@ def test_keep_lane_baseline_is_safe() -> None:
             crashes += int(env.env.unwrapped.vehicle.crashed)
     finally:
         env.close()
-    assert crashes / episodes <= 0.10, f"keep-lane baseline crashed {crashes}/{episodes}"
+    assert crashes / episodes <= 0.10, (
+        f"keep-lane baseline crashed {crashes}/{episodes}"
+    )
 
 
 def test_overtake_bonus_is_recorded() -> None:
