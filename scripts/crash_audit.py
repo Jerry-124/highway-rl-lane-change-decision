@@ -36,7 +36,11 @@ class RandomPolicy:
     def __init__(self, seed: int = 0, n_actions: int = len(ACTION_NAMES)) -> None:
         if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
             raise ValueError("seed must be a non-negative integer")
-        if isinstance(n_actions, bool) or not isinstance(n_actions, int) or n_actions < 1:
+        if (
+            isinstance(n_actions, bool)
+            or not isinstance(n_actions, int)
+            or n_actions < 1
+        ):
             raise ValueError("n_actions must be a positive integer")
         self.rng = np.random.default_rng(seed)
         self.n_actions = n_actions
@@ -168,9 +172,7 @@ def audit(policy_factory, episodes: int, seed: int) -> dict:
 
 def show(name: str, result: dict) -> None:
     causes = (
-        ", ".join(
-            f"{key}={value}" for key, value in sorted(result["causes"].items())
-        )
+        ", ".join(f"{key}={value}" for key, value in sorted(result["causes"].items()))
         or "none"
     )
     print(
