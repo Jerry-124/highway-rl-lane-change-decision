@@ -14,11 +14,18 @@
 - Added explicit validation for training counts, hyperparameter finiteness/ranges, batch geometry, resume artifacts, and critic-reset usage.
 - Added evaluation guards for empty episode sets, invalid action-mask shapes, out-of-range actions, unknown overtake outcomes, and metadata collisions with computed metrics.
 - Added automatic software/model provenance to newly generated evaluation summaries, including software version, algorithm, resolved model path, model SHA-256, seed provenance, and configuration overrides.
-- Added GitHub Actions regression checks on Python 3.10 and 3.12 with dependency validation, compilation, pytest, and Ruff linting.
+- Hardened `scripts/diagnose.py` so masked diagnostics query the environment mask interface rather than slicing observation tails, and made its random baseline locally seeded and reproducible.
+- Kept a single seeded random-policy instance across `crash_audit.py` episodes so the baseline RNG advances continuously instead of restarting the same action sequence every episode.
+- Added explicit diagnostic/audit argument validation and deterministic regression coverage for diagnostic RNG and action-mask semantics.
+- Replaced scenario-dependent test skips with deterministic constructed traffic states for slow/stopped-leader, overtake-state, and cooldown regressions.
+- Upgraded GitHub Actions to the current Node 24-compatible `actions/checkout@v7` and `actions/setup-python@v7` lines.
+- Added source/test/script compilation, Ruff formatting checks, and CPU-only PyTorch installation to the CI regression matrix.
 
 ### Validation / Key Results
 
-- The automated suite contains 35 pytest tests covering environment behavior, action masks, longitudinal control, reward timing, overtake accounting, configuration overrides, training-argument validation, evaluation provenance, and result serialization.
+- The automated suite contains 40 pytest tests covering environment behavior, action masks, longitudinal control, reward timing, overtake accounting, configuration overrides, training-argument validation, evaluation provenance, diagnostic reproducibility, and result serialization.
+- Scenario-sensitive regressions execute deterministically rather than being conditionally skipped when a sampled traffic scene is unsuitable.
+- CI targets Python 3.10 and 3.12 and checks dependency consistency, compilation, pytest, Ruff linting, and Ruff formatting.
 - The bundled `ppo_highway_v1.0.0.zip` model and its held-out validation/test artifacts are unchanged.
 - No policy retraining, reward retuning, benchmark rerun, or historical-result rewrite is part of this patch.
 
